@@ -1,0 +1,13 @@
+# Backups (Historie liegt jetzt in Git)
+*.bak
+*.bak_*
+# Generierte Karten-Artefakte
+*.pgm
+*.pgm.yaml
+# Trainierte Policy / grosse Binaerdaten
+*.pt
+*.onnx
+*.usd
+# Python-Cache
+__pycache__/
+*.pyc
