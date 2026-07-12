@@ -18,5 +18,6 @@ else
 fi
 export LD_LIBRARY_PATH="${BRIDGE_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd ~/IsaacLab
-./isaaclab.sh -p ~/ros_smoketest/play_go2_ros_scan.py "$@"
+./isaaclab.sh -p "$SCRIPT_DIR/play_go2_ros_scan.py" "$@"

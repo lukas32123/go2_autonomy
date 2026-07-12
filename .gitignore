@@ -11,3 +11,7 @@
 # Python-Cache
 __pycache__/
 *.pyc
+
+# Deployment-Policy: bewusste Ausnahme zu *.pt (Eingang der Evaluierung,
+# nicht bit-reproduzierbar nachtrainierbar)
+!isaac/policy.pt
