@@ -16,7 +16,7 @@ Rueckweg: cp …bak_smallroom …play_go2_ros_scan.py  (dann Isaac neu starten).
 import pathlib
 import sys
 
-TARGET = pathlib.Path.home() / "ros_smoketest" / "play_go2_ros_scan.py"
+TARGET = pathlib.Path(__file__).resolve().parent / "play_go2_ros_scan.py"
 BACKUP = pathlib.Path(str(TARGET) + ".bak_smallroom")
 
 START = "def design_scene() -> Articulation:"
@@ -95,7 +95,7 @@ def main():
     print("-" * 66)
     print(new_src[a:b])
     print("-" * 66)
-    print("OK. Naechster Schritt: Isaac neu starten (~/ros_smoketest/run_go2_scan.sh).")
+    print(f"OK. Naechster Schritt: Isaac neu starten ({TARGET.parent}/run_go2_scan.sh).")
 
 
 if __name__ == "__main__":
