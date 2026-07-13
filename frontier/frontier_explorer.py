@@ -84,7 +84,13 @@ class FrontierExplorer(Node):
         # 3b:
         self.declare_parameter("blacklist_radius", 0.5)      # m: Cluster nahe Fehlschlag ueberspringen
         self.declare_parameter("completion_patience", 5)     # aufeinanderfolgende STABILE leere Updates -> RETURNING (3c: 3->5)
-        self.declare_parameter("min_goal_distance", 0.3)     # m: Ziel, auf dem man schon steht, ueberspringen
+        self.declare_parameter("min_goal_distance", 0.5)     # m: Ziel, auf dem man schon steht, ueberspringen
+                                                             #    HARTE REGEL: > xy_goal_tolerance (Nav2, akt. 0.45),
+                                                             #    sonst meldet Nav2 sofort SUCCEEDED ohne Bewegung.
+        # B: Mindest-Wandabstand des Zielpunkts. = Footprint-Halblaenge (0.35 m):
+        #    naeher kann base_link physikalisch nicht an einer Wand stehen.
+        #    0.0 schaltet den Filter ab -> exakt altes Verhalten (Baseline-Laeufe).
+        self.declare_parameter("goal_clearance", 0.35)
         # 3c:
         self.declare_parameter("map_stability_tol", 50)      # Zellen: max. Aenderung bekannter Zellen, um als "stabil" zu gelten
         # A:
@@ -101,6 +107,7 @@ class FrontierExplorer(Node):
         self.blacklist_radius = float(self.get_parameter("blacklist_radius").value)
         self.completion_patience = int(self.get_parameter("completion_patience").value)
         self.min_goal_distance = float(self.get_parameter("min_goal_distance").value)
+        self.goal_clearance = float(self.get_parameter("goal_clearance").value)
         self.map_stability_tol = int(self.get_parameter("map_stability_tol").value)
         self.goal_timeout = float(self.get_parameter("goal_timeout").value)
         conn = int(self.get_parameter("connectivity").value)
@@ -151,7 +158,8 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             f"[3d] Autonomiezyklus aktiv: sub '{self.map_topic}', pub '{self.marker_topic}'; "
             f"size_weight={self.size_weight}, blacklist_radius={self.blacklist_radius}, "
-            f"min_goal_distance={self.min_goal_distance}, completion_patience={self.completion_patience}, "
+            f"min_goal_distance={self.min_goal_distance}, goal_clearance={self.goal_clearance}, "
+            f"completion_patience={self.completion_patience}, "
             f"map_stability_tol={self.map_stability_tol}, goal_timeout={self.goal_timeout}s, "
             f"frames {self.global_frame}->{self.robot_base_frame}"
         )
@@ -235,24 +243,36 @@ class FrontierExplorer(Node):
 
         # --- 3) Filtern -> Zentrum + Snap ---
         valid = []
+        skipped_clear = 0          # B: Cluster ohne einnehmbare Zielzelle (Wand-Artefakte)
+        clear_r = int(math.ceil(self.goal_clearance / res)) if self.goal_clearance > 0.0 else 0
         for comp in clusters:
             n = len(comp)
             if n < self.min_cluster_size:
                 continue
             sx = sy = 0.0
-            pts = []
+            cand = []
             for idx in comp:
                 r = idx // w
                 c = idx % w
                 px = ox + (c + 0.5) * res
                 py = oy + (r + 0.5) * res
-                pts.append((px, py))
+                cand.append((px, py, c, r))
                 sx += px
                 sy += py
             cx = sx / n
             cy = sy / n
-            gx, gy = min(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-            valid.append((cx, cy, n, gx, gy))
+            # B: Snap = naechste Zelle zum Zentroid, die genug Wandabstand hat.
+            #    Bei clear_r == 0 ist das exakt das alte Verhalten (naechste Zelle).
+            cand.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            goal = None
+            for (px, py, c, r) in cand:
+                if self.has_clearance(data, w, h, c, r, clear_r, occ):
+                    goal = (px, py)
+                    break
+            if goal is None:
+                skipped_clear += 1   # keine Zelle im Cluster ist fuer den Footprint
+                continue             # einnehmbar -> Wand-Artefakt, verwerfen
+            valid.append((cx, cy, n, goal[0], goal[1]))
 
         # --- 4) Pose (TF) ---
         robot = None
@@ -283,6 +303,7 @@ class FrontierExplorer(Node):
         sizes = sorted((v[2] for v in valid), reverse=True)
         self.get_logger().info(
             f"[{self.state}] Frontiers: {n_cells} Zellen | {len(valid)} gueltig | "
+            f"{skipped_clear} verworfen (Clearance) | "
             f"Groessen={sizes[:5]} | Karte={'stabil' if self.map_is_stable else 'waechst'} | "
             f"Blacklist={len(self.blacklist)} | Ziele erreicht={self.goals_reached}"
         )
@@ -300,6 +321,37 @@ class FrontierExplorer(Node):
             if (gx - bx) ** 2 + (gy - by) ** 2 <= r2:
                 return True
         return False
+
+    def has_clearance(self, data, w, h, c0, r0, rad, occ):
+        """B: True, wenn im Zellradius 'rad' um (c0, r0) keine BELEGTE Zelle liegt.
+
+        Warum: Footprint des Go2 = [[0.35, 0.155], ...] -- der Koerper reicht 0.35 m
+        nach vorn. Ein Ziel 0.2 m vor einer Wand kann base_link physikalisch nicht
+        einnehmen. MPPI zieht dann (GoalCritic) zur Wand und drueckt gleichzeitig
+        (CostCritic, inflation_radius 0.70) davon weg -> der Roboter pendelt dort
+        minutenlang. Solche Ziele gar nicht erst erzeugen.
+
+        UNBEKANNTE Zellen (< 0) zaehlen NICHT als Hindernis -- sonst haette per
+        Definition keine einzige Frontier-Zelle jemals Clearance.
+        """
+        if rad <= 0:
+            return True                      # Filter aus -> altes Verhalten
+        rad2 = rad * rad
+        for dr in range(-rad, rad + 1):
+            rr = r0 + dr
+            if rr < 0 or rr >= h:
+                continue                     # Kartenrand ist kein Hindernis
+            base = rr * w
+            dr2 = dr * dr
+            for dc in range(-rad, rad + 1):
+                if dc * dc + dr2 > rad2:
+                    continue                 # runder, nicht quadratischer Radius
+                cc = c0 + dc
+                if cc < 0 or cc >= w:
+                    continue
+                if data[base + cc] >= occ:
+                    return False
+        return True
 
     def select_best(self, valid, robot):
         """Bestes nicht-blacklistetes Cluster (min Kosten), Ziel mind. min_goal_distance entfernt."""
