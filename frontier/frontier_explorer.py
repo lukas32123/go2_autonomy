@@ -66,6 +66,7 @@ STATE_RETURNING = "RETURNING"
 STATE_DONE = "DONE"
 
 MAX_HOME_ATTEMPTS = 3   # 3d: max. Versuche fuer das Home-Ziel, dann aufgeben
+MAX_GOAL_ATTEMPTS = 2   # D: erst der ZWEITE Fehlschlag am selben Ziel fuehrt zur Blacklist
 
 
 class FrontierExplorer(Node):
@@ -90,7 +91,19 @@ class FrontierExplorer(Node):
         # B: Mindest-Wandabstand des Zielpunkts. = Footprint-Halblaenge (0.35 m):
         #    naeher kann base_link physikalisch nicht an einer Wand stehen.
         #    0.0 schaltet den Filter ab -> exakt altes Verhalten (Baseline-Laeufe).
-        self.declare_parameter("goal_clearance", 0.35)
+        # C/B: Mindest-Wandabstand des Zielpunkts.
+        #   0.70 m = inflation_radius aus nav2_go2.yaml. Der InflationLayer verhaengt
+        #   JENSEITS dieses Radius Kosten 0 -- das Ziel liegt damit per Konstruktion
+        #   ausserhalb des Kostenbergs. (0.35 = Footprint-Halblaenge reichte NICHT:
+        #   dort betragen die Inflationskosten noch ~140, MPPI befiehlt dann
+        #   Mikro-Geschwindigkeiten unter der Policy-Schwelle -> Stillstand.)
+        #   ACHTUNG: braucht Durchgaenge > 2*0.70 m. Fuer enge Tueren herabsetzen.
+        #   0.0 schaltet den Filter ab (altes Verhalten, Baseline-Laeufe).
+        self.declare_parameter("goal_clearance", 0.70)
+        # C: Obergrenze der Clearance-Tests pro Cluster (Rechenzeit-Deckel).
+        #   Kandidaten sind nach Abstand zum Zentroid sortiert; wer nach so vielen
+        #   Zellen keine freie gefunden hat, hat ein wandklebendes Cluster.
+        self.declare_parameter("max_snap_candidates", 80)
         # 3c:
         self.declare_parameter("map_stability_tol", 50)      # Zellen: max. Aenderung bekannter Zellen, um als "stabil" zu gelten
         # A:
@@ -108,6 +121,7 @@ class FrontierExplorer(Node):
         self.completion_patience = int(self.get_parameter("completion_patience").value)
         self.min_goal_distance = float(self.get_parameter("min_goal_distance").value)
         self.goal_clearance = float(self.get_parameter("goal_clearance").value)
+        self.max_snap_candidates = int(self.get_parameter("max_snap_candidates").value)
         self.map_stability_tol = int(self.get_parameter("map_stability_tol").value)
         self.goal_timeout = float(self.get_parameter("goal_timeout").value)
         conn = int(self.get_parameter("connectivity").value)
@@ -140,6 +154,13 @@ class FrontierExplorer(Node):
         # A: Ziel-Timeout
         self.goal_start_time = None      # Zeitpunkt (Node-Clock), zu dem das aktive Ziel gesendet wurde
         self.goal_timed_out = False      # True zwischen Timeout-Cancel und Result-Callback
+        # C: laufende Ziel-Revalidierung
+        self.goal_invalidated = False    # True zwischen Invalidierungs-Cancel und Result-Callback
+        self.invalid_reason = ""         # Grund, fuer die Logzeile
+        self._clear_offsets = None       # gecachte Kreisscheiben-Offsets fuer has_clearance
+        self._clear_offsets_rad = -1
+        # D: Fehlschlag-Zaehler je Zielort (10-cm-Raster)
+        self.goal_failures = {}
 
         map_qos = QoSProfile(
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -159,6 +180,7 @@ class FrontierExplorer(Node):
             f"[3d] Autonomiezyklus aktiv: sub '{self.map_topic}', pub '{self.marker_topic}'; "
             f"size_weight={self.size_weight}, blacklist_radius={self.blacklist_radius}, "
             f"min_goal_distance={self.min_goal_distance}, goal_clearance={self.goal_clearance}, "
+            f"max_goal_attempts={MAX_GOAL_ATTEMPTS}, revalidierung=an, "
             f"completion_patience={self.completion_patience}, "
             f"map_stability_tol={self.map_stability_tol}, goal_timeout={self.goal_timeout}s, "
             f"frames {self.global_frame}->{self.robot_base_frame}"
@@ -265,7 +287,7 @@ class FrontierExplorer(Node):
             #    Bei clear_r == 0 ist das exakt das alte Verhalten (naechste Zelle).
             cand.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
             goal = None
-            for (px, py, c, r) in cand:
+            for (px, py, c, r) in cand[: self.max_snap_candidates]:
                 if self.has_clearance(data, w, h, c, r, clear_r, occ):
                     goal = (px, py)
                     break
@@ -310,7 +332,13 @@ class FrontierExplorer(Node):
 
         self.publish_markers(msg.header, frontier, w, h, res, ox, oy, valid, best)
 
-        # --- 5) Zyklus: nur im IDLE ein neues Ziel waehlen/senden ---
+        # --- 5) C: aktives Ziel gegen die AKTUELLE Karte pruefen ---
+        if self.state == STATE_NAVIGATING and not self.goal_invalidated:
+            if not self.goal_still_valid(data, w, h, res, ox, oy, occ, clear_r):
+                self.abort_goal_invalid()
+                return
+
+        # --- 6) Zyklus: nur im IDLE ein neues Ziel waehlen/senden ---
         if self.state == STATE_IDLE:
             self.try_select_and_send()
 
@@ -322,36 +350,103 @@ class FrontierExplorer(Node):
                 return True
         return False
 
-    def has_clearance(self, data, w, h, c0, r0, rad, occ):
-        """B: True, wenn im Zellradius 'rad' um (c0, r0) keine BELEGTE Zelle liegt.
+    def clearance_offsets(self, rad):
+        """C: Kreisscheiben-Offsets, nach Abstand aufsteigend, gecacht.
 
-        Warum: Footprint des Go2 = [[0.35, 0.155], ...] -- der Koerper reicht 0.35 m
-        nach vorn. Ein Ziel 0.2 m vor einer Wand kann base_link physikalisch nicht
-        einnehmen. MPPI zieht dann (GoalCritic) zur Wand und drueckt gleichzeitig
-        (CostCritic, inflation_radius 0.70) davon weg -> der Roboter pendelt dort
-        minutenlang. Solche Ziele gar nicht erst erzeugen.
+        Aufsteigend, weil eine Wand meist NAH ist, wenn sie ueberhaupt stoert --
+        so bricht has_clearance im Ablehnungsfall so frueh wie moeglich ab.
+        """
+        if rad != self._clear_offsets_rad:
+            r2 = rad * rad
+            offs = [(dc, dr)
+                    for dr in range(-rad, rad + 1)
+                    for dc in range(-rad, rad + 1)
+                    if dc * dc + dr * dr <= r2]
+            offs.sort(key=lambda o: o[0] * o[0] + o[1] * o[1])
+            self._clear_offsets = tuple(offs)
+            self._clear_offsets_rad = rad
+        return self._clear_offsets
+
+    def has_clearance(self, data, w, h, c0, r0, rad, occ):
+        """B/C: True, wenn im Zellradius 'rad' um (c0, r0) keine BELEGTE Zelle liegt.
+
+        Warum 0.70 m (= inflation_radius aus nav2_go2.yaml): Der InflationLayer setzt
+        JENSEITS dieses Radius Kosten 0. Innerhalb steigen sie exponentiell (bei 0.35 m
+        noch ~140). MPPI wird dort vom CostCritic von der Wand weggedrueckt, waehrend der
+        GoalCritic hinzieht -- Ergebnis sind Befehle wie vx=0.06 m/s. Gemessen: unterhalb
+        von ~0.08 m/s setzt die gelernte Policy KEINEN Fuss (Totbereich). Der Roboter
+        steht, Nav2 meldet "Failed to make progress", der BT retryt endlos.
+        Also: solche Ziele gar nicht erst erzeugen.
 
         UNBEKANNTE Zellen (< 0) zaehlen NICHT als Hindernis -- sonst haette per
-        Definition keine einzige Frontier-Zelle jemals Clearance.
+        Definition keine einzige Frontier-Zelle jemals Clearance. Genau daraus folgt
+        aber die Restluecke, die goal_still_valid() schliesst: gegen eine Wand, die
+        beim Zielwahl-Zeitpunkt noch UNBEKANNT ist, kann dieser Filter nichts tun.
         """
         if rad <= 0:
             return True                      # Filter aus -> altes Verhalten
-        rad2 = rad * rad
-        for dr in range(-rad, rad + 1):
+        for (dc, dr) in self.clearance_offsets(rad):
             rr = r0 + dr
             if rr < 0 or rr >= h:
                 continue                     # Kartenrand ist kein Hindernis
-            base = rr * w
-            dr2 = dr * dr
-            for dc in range(-rad, rad + 1):
-                if dc * dc + dr2 > rad2:
-                    continue                 # runder, nicht quadratischer Radius
-                cc = c0 + dc
-                if cc < 0 or cc >= w:
-                    continue
-                if data[base + cc] >= occ:
-                    return False
+            cc = c0 + dc
+            if cc < 0 or cc >= w:
+                continue
+            if data[rr * w + cc] >= occ:
+                return False
         return True
+
+    # ------------------------------------------------------------------
+    # C: Laufende Revalidierung des AKTIVEN Ziels
+    def goal_still_valid(self, data, w, h, res, ox, oy, occ, clear_r):
+        """C: Ist das aktive Ziel auf der AKTUELLEN Karte noch anfahrbar?
+
+        Ein Frontier-Ziel liegt per Definition an der Grenze zum Unbekannten. Waehrend
+        der Anfahrt kann dort eine Wand auftauchen -- real beobachtet: Ziel (-3.03, -0.89)
+        lag 3 cm vor der Innenblock-Wand (x = -3.00), die zum Wahlzeitpunkt unbekannt war.
+        Nav2 haelt stur am Ziel fest (Restpfad sprang von 2 m auf 9.9 m), MPPI steckt im
+        Kostenberg fest, der Roboter steht 80 s. Deshalb: bei jedem Karten-Update pruefen.
+        """
+        if self.active_goal is None:
+            return True
+        gx, gy = self.active_goal
+        c = int((gx - ox) / res)
+        r = int((gy - oy) / res)
+        if c < 0 or c >= w or r < 0 or r >= h:
+            return True          # ausserhalb der Karte -> nicht beurteilbar
+        if data[r * w + c] >= occ:
+            self.invalid_reason = "Zielzelle ist inzwischen BELEGT"
+            return False
+        if not self.has_clearance(data, w, h, c, r, clear_r, occ):
+            self.invalid_reason = (
+                f"Wandabstand unter goal_clearance ({self.goal_clearance:.2f} m) gefallen"
+            )
+            return False
+        return True
+
+    def abort_goal_invalid(self):
+        """C: Aktives Ziel abbrechen -- OHNE Blacklist.
+
+        Bewusst keine Blacklist: Der Cluster als solcher bleibt gueltig. Die Wand ist
+        jetzt BEKANNT, also verwirft der Snap beim naechsten Update die wandnahen Zellen
+        von selbst und waehlt eine mit Abstand. Blacklisten wuerde die Region unnoetig
+        aufgeben -- genau der Fehler, der in Lauf B eine Kartenluecke hinterliess.
+        """
+        self.get_logger().warn(
+            f"[C] Ziel {self.active_goal} ist ungueltig geworden: {self.invalid_reason} "
+            f"-> abbrechen, Neuwahl (KEINE Blacklist)."
+        )
+        self.goal_invalidated = True
+        if self.current_goal_handle is not None:
+            self.current_goal_handle.cancel_goal_async()
+        else:
+            self.state = STATE_IDLE
+
+    def goal_key(self, goal):
+        """D: Zielort auf 10-cm-Raster -- 'derselbe Ort' trotz Snap-Jitter."""
+        if goal is None:
+            return None
+        return (round(goal[0], 1), round(goal[1], 1))
 
     def select_best(self, valid, robot):
         """Bestes nicht-blacklistetes Cluster (min Kosten), Ziel mind. min_goal_distance entfernt."""
@@ -458,6 +553,12 @@ class FrontierExplorer(Node):
             )
             self.state = STATE_IDLE
         elif status == GoalStatus.STATUS_CANCELED:
+            # C: Cancel durch Ziel-Invalidierung -> KEINE Blacklist, sofort neu waehlen
+            if self.goal_invalidated:
+                self.goal_invalidated = False
+                self.get_logger().info("[C] Ziel abgebrochen (Karte hat es entwertet). Neuwahl.")
+                self.state = STATE_IDLE
+                return
             # A: Cancel durch Timeout vs. Cancel durch Shutdown unterscheiden
             if self.goal_timed_out:
                 self.goal_timed_out = False
@@ -471,11 +572,27 @@ class FrontierExplorer(Node):
                 self.get_logger().warn("[3b] Ziel canceled (Shutdown).")
                 self.state = STATE_IDLE
         else:
-            self.get_logger().warn(
-                f"[3b] FEHLGESCHLAGEN (Status {status}) -> Blacklist {self.active_goal}."
-            )
-            if self.active_goal is not None:
-                self.blacklist.append(self.active_goal)
+            # D: NICHT beim ersten Fehlschlag blacklisten.
+            #   Real beobachtet: Der Explorer liest /map direkt und feuert ein Ziel im
+            #   frisch dazugekommenen Randstreifen; Nav2s global_costmap verdaut dieselbe
+            #   Kartenerweiterung ~8 ms spaeter und lehnt mit "outside bounds" ab. Das
+            #   groesste Cluster des Laufs (1283 Zellen) ging so an einem Millisekunden-
+            #   Rennen verloren. Ein einziger Retry loest das.
+            key = self.goal_key(self.active_goal)
+            self.goal_failures[key] = self.goal_failures.get(key, 0) + 1
+            fails = self.goal_failures[key]
+            if fails < MAX_GOAL_ATTEMPTS:
+                self.get_logger().warn(
+                    f"[D] FEHLGESCHLAGEN (Status {status}) bei {self.active_goal} "
+                    f"-- Versuch {fails}/{MAX_GOAL_ATTEMPTS}, KEINE Blacklist, Neuwahl."
+                )
+            else:
+                if self.active_goal is not None:
+                    self.blacklist.append(self.active_goal)
+                self.get_logger().warn(
+                    f"[3b] FEHLGESCHLAGEN (Status {status}) nach {fails} Versuchen "
+                    f"-> Blacklist {self.active_goal} ({len(self.blacklist)})."
+                )
             self.state = STATE_IDLE
 
     # ------------------------------------------------------------------
@@ -483,8 +600,8 @@ class FrontierExplorer(Node):
     def check_goal_timeout(self):
         if self.shutting_down or self.state != STATE_NAVIGATING:
             return
-        if self.goal_timed_out or self.goal_start_time is None:
-            return  # bereits ausgeloest oder kein aktives Ziel
+        if self.goal_timed_out or self.goal_invalidated or self.goal_start_time is None:
+            return  # bereits ausgeloest / wird gerade invalidiert / kein aktives Ziel
         elapsed = (self.get_clock().now() - self.goal_start_time).nanoseconds / 1e9
         if elapsed >= self.goal_timeout:
             self.get_logger().warn(
