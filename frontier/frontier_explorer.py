@@ -49,7 +49,7 @@ from rclpy.qos import (
     QoSHistoryPolicy,
 )
 
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import ColorRGBA
@@ -161,6 +161,18 @@ class FrontierExplorer(Node):
         self._clear_offsets_rad = -1
         # D: Fehlschlag-Zaehler je Zielort (10-cm-Raster)
         self.goal_failures = {}
+        # E: Metriken nach Expose 5.3 -- ALLE Zeiten in SIM-Zeit (nicht Wall-Time!)
+        self.t_start = None              # erster TF-Fix
+        self.t_explore_end = None        # 3c: Exploration abgeschlossen
+        self.t_home = None               # 3d: Home erreicht
+        self.dist_total = 0.0            # m, aus /odom integriert (Ground Truth)
+        self.dist_at_explore_end = None  # m, Schnappschuss bei 3c
+        self.last_odom_xy = None
+        self.n_revalidated = 0           # C: wie oft ein Ziel von der Karte entwertet wurde
+        self.n_retries = 0               # D: wie oft ein Ziel ohne Blacklist wiederholt wurde
+        self.n_timeouts = 0              # A: wie oft der Ziel-Timeout griff
+        self.rth_ok = None               # True/False, sobald entschieden
+        self.eval_printed = False
 
         map_qos = QoSProfile(
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -171,6 +183,9 @@ class FrontierExplorer(Node):
         self.sub = self.create_subscription(
             OccupancyGrid, self.map_topic, self.map_cb, map_qos
         )
+        # E: gefahrene Distanz aus /odom integrieren (Ground Truth, voller Takt).
+        #    Ueber TF/Karten-Updates (0.5 Hz) waere die Strecke stark unterschaetzt.
+        self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_cb, 20)
         self.pub = self.create_publisher(MarkerArray, self.marker_topic, 1)
 
         # A: 1-Hz-Timer prueft den Ziel-Timeout (nutzt Node-Clock -> sim time)
@@ -316,6 +331,8 @@ class FrontierExplorer(Node):
         # (passiert vor dem ersten Ziel -> tatsaechliche Startpose im map-Frame)
         if self.home_pose is None and robot is not None:
             self.home_pose = robot
+            self.t_start = self.get_clock().now()      # E: Startzeit (Sim)
+            self.dist_total = 0.0                      # E: Zaehler auf 0
             self.get_logger().info(
                 f"[3d] Home-Pose gemerkt (Startpose): ({robot[0]:.2f}, {robot[1]:.2f})."
             )
@@ -341,6 +358,19 @@ class FrontierExplorer(Node):
         # --- 6) Zyklus: nur im IDLE ein neues Ziel waehlen/senden ---
         if self.state == STATE_IDLE:
             self.try_select_and_send()
+
+    # ------------------------------------------------------------------
+    # E: Distanzintegration (Expose 5.3 "zurueckgelegte Distanz")
+    def odom_cb(self, msg):
+        p = msg.pose.pose.position
+        xy = (p.x, p.y)
+        if self.last_odom_xy is not None:
+            dx = xy[0] - self.last_odom_xy[0]
+            dy = xy[1] - self.last_odom_xy[1]
+            step = math.hypot(dx, dy)
+            if step < 0.5:               # > 0.5 m in einem Takt = Glitch, ignorieren
+                self.dist_total += step
+        self.last_odom_xy = xy
 
     # ------------------------------------------------------------------
     def is_blacklisted(self, gx, gy):
@@ -437,6 +467,7 @@ class FrontierExplorer(Node):
             f"-> abbrechen, Neuwahl (KEINE Blacklist)."
         )
         self.goal_invalidated = True
+        self.n_revalidated += 1                        # E
         if self.current_goal_handle is not None:
             self.current_goal_handle.cancel_goal_async()
         else:
@@ -494,6 +525,9 @@ class FrontierExplorer(Node):
                     f"{self.completion_patience} Updates. {self.goals_reached} Ziele erreicht. "
                     f"Starte Return-to-Home."
                 )
+                # E: Explorationsphase abgeschlossen -- Zeit und Distanz einfrieren
+                self.t_explore_end = self.get_clock().now()
+                self.dist_at_explore_end = self.dist_total
                 self.start_return_home()
             return
         self.empty_count = 0
@@ -582,6 +616,7 @@ class FrontierExplorer(Node):
             self.goal_failures[key] = self.goal_failures.get(key, 0) + 1
             fails = self.goal_failures[key]
             if fails < MAX_GOAL_ATTEMPTS:
+                self.n_retries += 1                    # E
                 self.get_logger().warn(
                     f"[D] FEHLGESCHLAGEN (Status {status}) bei {self.active_goal} "
                     f"-- Versuch {fails}/{MAX_GOAL_ATTEMPTS}, KEINE Blacklist, Neuwahl."
@@ -609,6 +644,7 @@ class FrontierExplorer(Node):
                 f"(> {self.goal_timeout:.0f}s) -> cancele."
             )
             self.goal_timed_out = True   # Blacklist erfolgt im Result-Callback (CANCELED)
+            self.n_timeouts += 1         # E
             if self.current_goal_handle is not None:
                 self.current_goal_handle.cancel_goal_async()
 
@@ -668,10 +704,13 @@ class FrontierExplorer(Node):
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.state = STATE_DONE
             self.active_goal = None
+            self.t_home = self.get_clock().now()       # E
+            self.rth_ok = True                         # E
             self.get_logger().info(
                 f"[3d] ===> HOME ERREICHT: zurueck an der Startpose. "
                 f"{self.goals_reached} Frontier-Ziele erkundet. Autonomiezyklus komplett."
             )
+            self.print_eval()                          # E
             return
         if status == GoalStatus.STATUS_CANCELED:
             self.get_logger().warn("[3d] Home-Ziel canceled (Shutdown).")
@@ -692,9 +731,69 @@ class FrontierExplorer(Node):
             )
             self.state = STATE_DONE
             self.active_goal = None
+            self.t_home = self.get_clock().now()       # E
+            self.rth_ok = False                        # E
+            self.print_eval()                          # E
+
+    # ------------------------------------------------------------------
+    # E: Auswertung nach Expose 5.3 -- eine Zeile pro Lauf, direkt uebernehmbar
+    def print_eval(self):
+        if self.eval_printed:
+            return
+        self.eval_printed = True
+
+        def secs(a, b):
+            if a is None or b is None:
+                return None
+            return (b - a).nanoseconds / 1e9
+
+        t_expl = secs(self.t_start, self.t_explore_end)
+        t_rth = secs(self.t_explore_end, self.t_home)
+        t_ges = secs(self.t_start, self.t_home)
+        d_expl = self.dist_at_explore_end
+        d_rth = (self.dist_total - d_expl) if d_expl is not None else None
+        d_ges = self.dist_total
+
+        def f(v, nk=1):
+            return "n/a" if v is None else f"{v:.{nk}f}"
+
+        rth = {True: "ERFOLGREICH", False: "FEHLGESCHLAGEN"}.get(self.rth_ok, "ABGEBROCHEN")
+
+        L = self.get_logger()
+        L.info("=" * 64)
+        L.info("[EVAL] LAUF-METRIKEN (Expose 5.3) -- ALLE ZEITEN IN SIM-ZEIT")
+        L.info("=" * 64)
+        L.info(f"[EVAL] Ziele erreicht         : {self.goals_reached}")
+        L.info(f"[EVAL] Explorationszeit       : {f(t_expl)} s")
+        L.info(f"[EVAL] Return-to-Home-Zeit    : {f(t_rth)} s")
+        L.info(f"[EVAL] Gesamtzeit             : {f(t_ges)} s")
+        L.info(f"[EVAL] Distanz Exploration    : {f(d_expl, 2)} m")
+        L.info(f"[EVAL] Distanz Return-to-Home : {f(d_rth, 2)} m")
+        L.info(f"[EVAL] Distanz gesamt         : {f(d_ges, 2)} m")
+        L.info(f"[EVAL] Return-to-Home         : {rth}")
+        L.info(f"[EVAL] Blacklist-Eintraege    : {len(self.blacklist)}")
+        L.info(f"[EVAL] Ziel-Revalidierungen(C): {self.n_revalidated}")
+        L.info(f"[EVAL] Ziel-Retries (D)       : {self.n_retries}")
+        L.info(f"[EVAL] Ziel-Timeouts (A)      : {self.n_timeouts}")
+        L.info(f"[EVAL] Konfig                 : goal_clearance={self.goal_clearance} "
+               f"min_goal_distance={self.min_goal_distance} size_weight={self.size_weight}")
+        # Eine Zeile fuer die Tabelle. Semikolon = deutsches Excel.
+        L.info(
+            "[EVAL] CSV;ziele;t_expl;t_rth;t_ges;d_expl;d_rth;d_ges;rth;blacklist;reval;retry;timeout;clearance"
+        )
+        L.info(
+            f"[EVAL] CSV;{self.goals_reached};{f(t_expl)};{f(t_rth)};{f(t_ges)};"
+            f"{f(d_expl, 2)};{f(d_rth, 2)};{f(d_ges, 2)};{rth};{len(self.blacklist)};"
+            f"{self.n_revalidated};{self.n_retries};{self.n_timeouts};{self.goal_clearance}"
+        )
+        L.info("=" * 64)
+        L.info("[EVAL] HINWEIS: Karte JETZT sichern, solange SLAM laeuft:")
+        L.info("[EVAL]   ros2 run nav2_map_server map_saver_cli -f /root/maps/<name> -t /map")
+        L.info("=" * 64)
 
     def cancel_active_goal(self):
         self.shutting_down = True
+        self.print_eval()          # E: auch bei Strg-C die Teilmetriken ausgeben
         if self.current_goal_handle is not None:
             self.get_logger().info("[3b] Beende -> cancele laufendes Nav2-Ziel...")
             try:
