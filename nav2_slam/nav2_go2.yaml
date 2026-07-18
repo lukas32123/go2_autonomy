@@ -101,8 +101,8 @@ controller_server:
       # auf der Stelle (rein wz, wie Handbetrieb), uebergibt dann an MPPI.
       angular_dist_threshold: 0.785        # rad (~45 deg): ab hier erst eindrehen
       forward_sampling_distance: 0.5       # m: Pfadpunkt voraus zur Zielrichtung
-      rotate_to_heading_angular_vel: 1.2   # rad/s Drehrate (konservativ, tunebar)
-      max_angular_accel: 3.2               # rad/s^2
+      rotate_to_heading_angular_vel: 0.6   # rad/s Drehrate (konservativ, tunebar)
+      max_angular_accel: 8.0               # rad/s^2
       simulate_ahead_time: 1.0             # s: Kollisionscheck waehrend Drehung
       time_steps: 56
       model_dt: 0.05
