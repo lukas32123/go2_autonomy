@@ -228,44 +228,78 @@ class Go2RosBridge(Node):
 
 
 def design_scene() -> Articulation:
+    import math
+
     ground_cfg = sim_utils.GroundPlaneCfg()
     ground_cfg.func("/World/ground", ground_cfg)
     light_cfg = sim_utils.DomeLightCfg(intensity=750.0, color=(1.0, 1.0, 1.0))
     light_cfg.func("/World/Light", light_cfg)
 
-    # --- Ring-Flur-Testumgebung (parametrisch) ------------------------------
-    # Quadratischer Aussenring (4 Waende) um einen soliden Innenblock; dazwischen
-    # der Flur. Der LiDAR sieht an jeder Ecke nicht um die Kurve -> echte Frontiers,
-    # die Schleife muss komplett abgelaufen werden (lange Strecke fuer Return-to-Home).
-    OUTER = 10.0        # Aussenmass (Wand-Mittellinie), m
-    CORRIDOR = 2.0      # Flurbreite, m  (falls Nav2 zu eng plant: auf 2.5 erhoehen)
-    WALL_T = 0.1        # Wanddicke, m
-    WALL_H = 1.0        # Wandhoehe, m (LiDAR auf 0.12 m -> klar sichtbar)
-    half = OUTER / 2.0
-    inner = OUTER - 2.0 * CORRIDOR      # Innenblock-Kantenlaenge
-    z = WALL_H / 2.0                    # Zentrum-z, Wand steht auf dem Boden
-    gray = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.6, 0.6))
-    dark = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45))
+    # ---------------- Saeulenraum (parametrisch) ----------------
+    ROOM        = 20.0    # Aussenmass, Wand-Mittellinie [m]
+    WALL_T      = 0.20    # Wanddicke [m]
+    WALL_H      = 1.00    # Wandhoehe [m]
+    PILLAR      = 0.60    # Kantenlaenge der quadratischen Saeulen [m]
+    PITCH       = 2.50    # Grundraster [m]
+    JITTER      = 0.35    # max. Auslenkung aus dem Raster [m]  (0.0 = exaktes Raster)
+    EDGE_MARGIN = 1.60    # Mindestabstand Saeulenmitte <-> Wandflaeche [m]
+    START_CLEAR = 1.80    # Radius um die Startpose ohne Saeule [m]
+
+    half = ROOM / 2.0
+    inner = half - WALL_T / 2.0        # Innenflaeche der Waende
+    z = WALL_H / 2.0
+
+    gray = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.60, 0.60, 0.60))
+    dark = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.42, 0.42, 0.48))
     coll = sim_utils.CollisionPropertiesCfg()
 
-    # 4 Aussenwaende (Nord/Sued lang in x, Ost/West lang in y)
-    wall_ns = sim_utils.CuboidCfg(size=(OUTER, WALL_T, WALL_H), visual_material=gray, collision_props=coll)
-    wall_ns.func("/World/wall_n", wall_ns, translation=(0.0, half, z))
-    wall_ns.func("/World/wall_s", wall_ns, translation=(0.0, -half, z))
-    wall_ew = sim_utils.CuboidCfg(size=(WALL_T, OUTER, WALL_H), visual_material=gray, collision_props=coll)
-    wall_ew.func("/World/wall_e", wall_ew, translation=(half, 0.0, z))
-    wall_ew.func("/World/wall_w", wall_ew, translation=(-half, 0.0, z))
+    # --- Aussenwaende ---
+    for s in (1.0, -1.0):
+        w = sim_utils.CuboidCfg(size=(ROOM + WALL_T, WALL_T, WALL_H),
+                                visual_material=gray, collision_props=coll)
+        w.func("/World/wall_ns_%d" % int(s), w, translation=(0.0, s * half, z))
+        w = sim_utils.CuboidCfg(size=(WALL_T, ROOM + WALL_T, WALL_H),
+                                visual_material=gray, collision_props=coll)
+        w.func("/World/wall_ew_%d" % int(s), w, translation=(s * half, 0.0, z))
 
-    # Solider Innenblock -> Mitte unpassierbar, erzwingt die Schleife
-    block = sim_utils.CuboidCfg(size=(inner, inner, WALL_H), visual_material=dark, collision_props=coll)
-    block.func("/World/inner_block", block, translation=(0.0, 0.0, z))
-    # ------------------------------------------------------------------------
+    # --- Startpose: freie Bucht an der Suedwand ---
+    start_x, start_y = 0.0, -(inner - 1.20)
+
+    def jitter(i, j, salt):
+        """Deterministische Auslenkung in [-1, 1). Kein Zufallsgenerator."""
+        v = math.sin(i * 127.1 + j * 311.7 + salt * 74.7) * 43758.5453
+        return (v - math.floor(v)) * 2.0 - 1.0
+
+    lim = inner - EDGE_MARGIN - PILLAR / 2.0 - JITTER
+    ks = []
+    k = 0
+    while k * PITCH <= lim:
+        ks.extend([0] if k == 0 else [-k, k])
+        k += 1
+    ks.sort()
+
+    n = 0
+    skipped = 0
+    for i in ks:
+        for j in ks:
+            px = i * PITCH + JITTER * jitter(i, j, 1.0)
+            py = j * PITCH + JITTER * jitter(i, j, 2.0)
+            if math.hypot(px - start_x, py - start_y) < START_CLEAR:
+                skipped += 1
+                continue
+            p = sim_utils.CuboidCfg(size=(PILLAR, PILLAR, WALL_H),
+                                    visual_material=dark, collision_props=coll)
+            p.func("/World/pillar_%d" % n, p, translation=(px, py, z))
+            n += 1
+
+    print("[SZENE] Saeulenraum %.1f x %.1f m | %d Saeulen a %.2f m "
+          "(Raster %.2f m, Auslenkung +-%.2f m, %d an der Startpose ausgelassen)"
+          % (ROOM, ROOM, n, PILLAR, PITCH, JITTER, skipped))
 
     robot_cfg = UNITREE_GO2_CFG.replace(prim_path="/World/Robot")
-    # Startpose IM SUED-FLUR (Ursprung ist jetzt der Block!). Blick +x (Ost), umrundet den Block.
-    start_y = -(inner / 2.0 + CORRIDOR / 2.0)
-    robot_cfg.init_state.pos = (0.0, start_y, 0.4)
+    robot_cfg.init_state.pos = (start_x, start_y, 0.4)
     return Articulation(robot_cfg)
+
 
 
 def compute_obs(robot, command, last_action):
