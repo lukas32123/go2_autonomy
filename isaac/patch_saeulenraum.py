@@ -71,13 +71,15 @@ NEW_FUNC = '''def design_scene() -> Articulation:
     coll = sim_utils.CollisionPropertiesCfg()
 
     # --- Aussenwaende ---
-    for s in (1.0, -1.0):
+    # WICHTIG: USD erlaubt in Prim-Namen KEIN Minuszeichen. Deshalb wird ueber
+    # den Index (0/1) benannt, nicht ueber das Vorzeichen.
+    for idx, s in enumerate((1.0, -1.0)):
         w = sim_utils.CuboidCfg(size=(ROOM + WALL_T, WALL_T, WALL_H),
                                 visual_material=gray, collision_props=coll)
-        w.func("/World/wall_ns_%d" % int(s), w, translation=(0.0, s * half, z))
+        w.func("/World/wall_ns_%d" % idx, w, translation=(0.0, s * half, z))
         w = sim_utils.CuboidCfg(size=(WALL_T, ROOM + WALL_T, WALL_H),
                                 visual_material=gray, collision_props=coll)
-        w.func("/World/wall_ew_%d" % int(s), w, translation=(s * half, 0.0, z))
+        w.func("/World/wall_ew_%d" % idx, w, translation=(s * half, 0.0, z))
 
     # --- Startpose: freie Bucht an der Suedwand ---
     start_x, start_y = 0.0, -(inner - 1.20)
