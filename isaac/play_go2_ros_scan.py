@@ -228,78 +228,106 @@ class Go2RosBridge(Node):
 
 
 def design_scene() -> Articulation:
-    import math
-
     ground_cfg = sim_utils.GroundPlaneCfg()
     ground_cfg.func("/World/ground", ground_cfg)
     light_cfg = sim_utils.DomeLightCfg(intensity=750.0, color=(1.0, 1.0, 1.0))
     light_cfg.func("/World/Light", light_cfg)
 
-    # ---------------- Saeulenraum (parametrisch) ----------------
-    ROOM        = 20.0    # Aussenmass, Wand-Mittellinie [m]
-    WALL_T      = 0.20    # Wanddicke [m]
-    WALL_H      = 1.00    # Wandhoehe [m]
-    PILLAR      = 0.60    # Kantenlaenge der quadratischen Saeulen [m]
-    PITCH       = 2.50    # Grundraster [m]
-    JITTER      = 0.35    # max. Auslenkung aus dem Raster [m]  (0.0 = exaktes Raster)
-    EDGE_MARGIN = 1.60    # Mindestabstand Saeulenmitte <-> Wandflaeche [m]
-    START_CLEAR = 1.80    # Radius um die Startpose ohne Saeule [m]
+    # ---------------- Uni-Ringflur (parametrisch) ----------------
+    # Grundriss nach realem Uni-Gebaeude: Ring um einen soliden Kern, zwei
+    # gegenueberliegende Fluren breit, zwei schmal, Tuernischen als Merkmale.
+    OUTER         = 30.0    # Aussenmass, Mittellinie der Nischen-Rueckwand [m]
+    CORR_WIDE     = 6.0     # Flurbreite Nord/Sued [m]
+    CORR_NARROW   = 3.0     # Flurbreite Ost/West [m]  (Vorgabe 2.5-4.0)
+    NICHE_DEPTH   = 0.40    # Nischentiefe [m]
+    NICHE_WIDTH   = 1.40    # Nischenbreite (Tuerbreite + Rahmen) [m]
+    PITCH_WIDE    = 6.0     # Nischenabstand auf den breiten Seiten [m]
+    PITCH_NARROW  = 4.0     # Nischenabstand auf den schmalen Seiten [m]
+    CORNER_MARGIN = 1.5     # keine Nische naeher als das an einer Ecke [m]
+    WALL_T        = 0.20    # Wanddicke [m]
+    WALL_H        = 1.00    # Wandhoehe [m]
 
-    half = ROOM / 2.0
-    inner = half - WALL_T / 2.0        # Innenflaeche der Waende
+    half = OUTER / 2.0
+    back = half - WALL_T / 2.0            # Innenflaeche der Rueckwand (Nischengrund)
+    pier = back - NICHE_DEPTH             # Flurgrenze aussen (Pfeilerflaeche)
+    core_y = pier - CORR_WIDE             # Kernflaeche Nord/Sued
+    core_x = pier - CORR_NARROW           # Kernflaeche Ost/West (Pfeilerflaeche)
+    core_solid = core_x - NICHE_DEPTH     # Kern-Vollkoerper reicht bis hier
     z = WALL_H / 2.0
 
     gray = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.60, 0.60, 0.60))
-    dark = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.42, 0.42, 0.48))
+    dark = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45))
     coll = sim_utils.CollisionPropertiesCfg()
 
-    # --- Aussenwaende ---
-    for s in (1.0, -1.0):
-        w = sim_utils.CuboidCfg(size=(ROOM + WALL_T, WALL_T, WALL_H),
-                                visual_material=gray, collision_props=coll)
-        w.func("/World/wall_ns_%d" % int(s), w, translation=(0.0, s * half, z))
-        w = sim_utils.CuboidCfg(size=(WALL_T, ROOM + WALL_T, WALL_H),
-                                visual_material=gray, collision_props=coll)
-        w.func("/World/wall_ew_%d" % int(s), w, translation=(s * half, 0.0, z))
+    def niche_centers(length, pitch):
+        """Nischenmitten, symmetrisch um 0, mit Abstand zu den Ecken."""
+        lim = length / 2.0 - CORNER_MARGIN - NICHE_WIDTH / 2.0
+        out, k = [], 0
+        while k * pitch <= lim:
+            out.extend([0.0] if k == 0 else [-k * pitch, k * pitch])
+            k += 1
+        return sorted(out)
 
-    # --- Startpose: freie Bucht an der Suedwand ---
-    start_x, start_y = 0.0, -(inner - 1.20)
-
-    def jitter(i, j, salt):
-        """Deterministische Auslenkung in [-1, 1). Kein Zufallsgenerator."""
-        v = math.sin(i * 127.1 + j * 311.7 + salt * 74.7) * 43758.5453
-        return (v - math.floor(v)) * 2.0 - 1.0
-
-    lim = inner - EDGE_MARGIN - PILLAR / 2.0 - JITTER
-    ks = []
-    k = 0
-    while k * PITCH <= lim:
-        ks.extend([0] if k == 0 else [-k, k])
-        k += 1
-    ks.sort()
+    def pier_spans(length, centers):
+        """Intervalle zwischen den Nischen -> dort stehen die Pfeiler."""
+        out, lo = [], -length / 2.0
+        for c in centers:
+            hi = c - NICHE_WIDTH / 2.0
+            if hi - lo > 0.05:
+                out.append((lo, hi))
+            lo = c + NICHE_WIDTH / 2.0
+        if length / 2.0 - lo > 0.05:
+            out.append((lo, length / 2.0))
+        return out
 
     n = 0
-    skipped = 0
-    for i in ks:
-        for j in ks:
-            px = i * PITCH + JITTER * jitter(i, j, 1.0)
-            py = j * PITCH + JITTER * jitter(i, j, 2.0)
-            if math.hypot(px - start_x, py - start_y) < START_CLEAR:
-                skipped += 1
-                continue
-            p = sim_utils.CuboidCfg(size=(PILLAR, PILLAR, WALL_H),
-                                    visual_material=dark, collision_props=coll)
-            p.func("/World/pillar_%d" % n, p, translation=(px, py, z))
+    for s in (1.0, -1.0):
+        # --- breite Seiten (Nord/Sued): Rueckwand + Pfeiler, Nischen nur aussen
+        w = sim_utils.CuboidCfg(size=(OUTER, WALL_T, WALL_H),
+                                visual_material=gray, collision_props=coll)
+        w.func("/World/wall_ns_%d" % n, w, translation=(0.0, s * half, z))
+        n += 1
+        for a, b in pier_spans(OUTER, niche_centers(OUTER, PITCH_WIDE)):
+            p = sim_utils.CuboidCfg(size=(b - a, NICHE_DEPTH, WALL_H),
+                                    visual_material=gray, collision_props=coll)
+            p.func("/World/pier_ns_%d" % n, p,
+                   translation=((a + b) / 2.0, s * (pier + NICHE_DEPTH / 2.0), z))
+            n += 1
+        # --- schmale Seiten (Ost/West): Rueckwand + Pfeiler
+        w = sim_utils.CuboidCfg(size=(WALL_T, OUTER, WALL_H),
+                                visual_material=gray, collision_props=coll)
+        w.func("/World/wall_ew_%d" % n, w, translation=(s * half, 0.0, z))
+        n += 1
+        for a, b in pier_spans(OUTER, niche_centers(OUTER, PITCH_NARROW)):
+            p = sim_utils.CuboidCfg(size=(NICHE_DEPTH, b - a, WALL_H),
+                                    visual_material=gray, collision_props=coll)
+            p.func("/World/pier_ew_%d" % n, p,
+                   translation=(s * (pier + NICHE_DEPTH / 2.0), (a + b) / 2.0, z))
             n += 1
 
-    print("[SZENE] Saeulenraum %.1f x %.1f m | %d Saeulen a %.2f m "
-          "(Raster %.2f m, Auslenkung +-%.2f m, %d an der Startpose ausgelassen)"
-          % (ROOM, ROOM, n, PILLAR, PITCH, JITTER, skipped))
+    # --- Kern: Vollkoerper, dazu Pfeiler auf den Ost/West-Flaechen ---------
+    core = sim_utils.CuboidCfg(size=(2.0 * core_solid, 2.0 * core_y, WALL_H),
+                               visual_material=dark, collision_props=coll)
+    core.func("/World/core", core, translation=(0.0, 0.0, z))
+    n += 1
+    core_len = 2.0 * core_y
+    for s in (1.0, -1.0):
+        for a, b in pier_spans(core_len, niche_centers(core_len, PITCH_NARROW)):
+            p = sim_utils.CuboidCfg(size=(NICHE_DEPTH, b - a, WALL_H),
+                                    visual_material=dark, collision_props=coll)
+            p.func("/World/core_pier_%d" % n, p,
+                   translation=(s * (core_solid + NICHE_DEPTH / 2.0), (a + b) / 2.0, z))
+            n += 1
+
+    print("[SZENE] Uni-Ringflur %.1f m | Flur N/S %.1f m, O/W %.1f m | "
+          "Nische %.2f x %.2f m | %d Prims"
+          % (OUTER, pier - core_y, pier - core_x, NICHE_WIDTH, NICHE_DEPTH, n))
 
     robot_cfg = UNITREE_GO2_CFG.replace(prim_path="/World/Robot")
-    robot_cfg.init_state.pos = (start_x, start_y, 0.4)
+    # Startpose in der Mitte des SUEDflurs (breite Seite), Blick +x (Ost).
+    start_y = -(core_y + CORR_WIDE / 2.0)
+    robot_cfg.init_state.pos = (0.0, start_y, 0.4)
     return Articulation(robot_cfg)
-
 
 
 def compute_obs(robot, command, last_action):
