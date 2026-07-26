@@ -100,6 +100,13 @@ class FrontierExplorer(Node):
         #   ACHTUNG: braucht Durchgaenge > 2*0.70 m. Fuer enge Tueren herabsetzen.
         #   0.0 schaltet den Filter ab (altes Verhalten, Baseline-Laeufe).
         self.declare_parameter("goal_clearance", 0.70)
+        # BEST-PRACTICE (Reachable-Frontier via Karten-Inflation):
+        #   Vor der Detektion belegte Zellen um diesen Radius verdicken;
+        #   Frontiers naeher als der Radius an einem Hindernis entstehen dann
+        #   nicht. Ersetzt konzeptionell die goal_clearance-Nachpruefung
+        #   (Senarathne 2015, Sun 2020). 0.0 = AUS -> bisheriges Verhalten.
+        #   Startwert = umschriebener Radius ~0.38 m.
+        self.declare_parameter("reachability_inflation", 0.0)
         # C: Obergrenze der Clearance-Tests pro Cluster (Rechenzeit-Deckel).
         #   Kandidaten sind nach Abstand zum Zentroid sortiert; wer nach so vielen
         #   Zellen keine freie gefunden hat, hat ein wandklebendes Cluster.
@@ -121,6 +128,7 @@ class FrontierExplorer(Node):
         self.completion_patience = int(self.get_parameter("completion_patience").value)
         self.min_goal_distance = float(self.get_parameter("min_goal_distance").value)
         self.goal_clearance = float(self.get_parameter("goal_clearance").value)
+        self.reach_infl = float(self.get_parameter("reachability_inflation").value)
         self.max_snap_candidates = int(self.get_parameter("max_snap_candidates").value)
         self.map_stability_tol = int(self.get_parameter("map_stability_tol").value)
         self.goal_timeout = float(self.get_parameter("goal_timeout").value)
@@ -223,6 +231,38 @@ class FrontierExplorer(Node):
         max_occ = self.max_occ_nbr
         nbrs = self.nbrs
         known = 0
+
+        # --- BEST-PRACTICE: belegte Zellen um reach_infl verdicken -----------
+        # blocked[i] = 1, wenn Zelle i belegt ODER innerhalb reach_infl um eine
+        # belegte Zelle. Solche Zellen werden bei der Detektion wie Hindernis
+        # behandelt -> Frontiers in zu engen Luecken entstehen nicht.
+        # reach_infl <= 0 -> blocked=None -> exakt bisheriges Verhalten.
+        infl_cells = int(math.ceil(self.reach_infl / res)) if self.reach_infl > 0.0 else 0
+        if infl_cells > 0:
+            blocked = bytearray(w * h)
+            ring = []
+            for i in range(w * h):
+                if data[i] >= occ and data[i] >= 0:
+                    blocked[i] = 1
+                    ring.append(i)
+            for _ in range(infl_cells):
+                nxt = []
+                for idx in ring:
+                    r = idx // w
+                    c = idx % w
+                    for dc, dr in nbrs:
+                        nc = c + dc
+                        nr = r + dr
+                        if 0 <= nc < w and 0 <= nr < h:
+                            nidx = nr * w + nc
+                            if not blocked[nidx]:
+                                blocked[nidx] = 1
+                                nxt.append(nidx)
+                ring = nxt
+        else:
+            blocked = None
+        # --------------------------------------------------------------------
+
         for row in range(h):
             base = row * w
             for col in range(w):
@@ -232,6 +272,8 @@ class FrontierExplorer(Node):
                 known += 1             # frei oder belegt = bekannt (3c)
                 if v >= occ:
                     continue          # belegt -> keine Frontier-Kandidatin
+                if blocked is not None and blocked[base + col]:
+                    continue          # BEST-PRACTICE: in Inflationszone -> keine Frontier
                 has_unknown = False
                 occ_count = 0
                 for dc, dr in nbrs:
