@@ -65,8 +65,8 @@ STATE_NAVIGATING = "NAVIGATING"
 STATE_RETURNING = "RETURNING"
 STATE_DONE = "DONE"
 
-MAX_HOME_ATTEMPTS = 3   # 3d: max. Versuche fuer das Home-Ziel, dann aufgeben
-MAX_GOAL_ATTEMPTS = 2   # D: erst der ZWEITE Fehlschlag am selben Ziel fuehrt zur Blacklist
+MAX_HOME_ATTEMPTS = 3   
+MAX_GOAL_ATTEMPTS = 2   
 
 
 class FrontierExplorer(Node):
@@ -82,39 +82,17 @@ class FrontierExplorer(Node):
         self.declare_parameter("global_frame", "map")
         self.declare_parameter("robot_base_frame", "base_link")
         self.declare_parameter("size_weight", 0.05)
-        # 3b:
-        self.declare_parameter("blacklist_radius", 0.5)      # m: Cluster nahe Fehlschlag ueberspringen
-        self.declare_parameter("completion_patience", 5)     # aufeinanderfolgende STABILE leere Updates -> RETURNING (3c: 3->5)
-        self.declare_parameter("min_goal_distance", 0.5)     # m: Ziel, auf dem man schon steht, ueberspringen
-                                                             #    HARTE REGEL: > xy_goal_tolerance (Nav2, akt. 0.45),
-                                                             #    sonst meldet Nav2 sofort SUCCEEDED ohne Bewegung.
-        # B: Mindest-Wandabstand des Zielpunkts. = Footprint-Halblaenge (0.35 m):
-        #    naeher kann base_link physikalisch nicht an einer Wand stehen.
-        #    0.0 schaltet den Filter ab -> exakt altes Verhalten (Baseline-Laeufe).
-        # C/B: Mindest-Wandabstand des Zielpunkts.
-        #   0.70 m = inflation_radius aus nav2_go2.yaml. Der InflationLayer verhaengt
-        #   JENSEITS dieses Radius Kosten 0 -- das Ziel liegt damit per Konstruktion
-        #   ausserhalb des Kostenbergs. (0.35 = Footprint-Halblaenge reichte NICHT:
-        #   dort betragen die Inflationskosten noch ~140, MPPI befiehlt dann
-        #   Mikro-Geschwindigkeiten unter der Policy-Schwelle -> Stillstand.)
-        #   ACHTUNG: braucht Durchgaenge > 2*0.70 m. Fuer enge Tueren herabsetzen.
-        #   0.0 schaltet den Filter ab (altes Verhalten, Baseline-Laeufe).
+        self.declare_parameter("blacklist_radius", 0.5)      
+        self.declare_parameter("completion_patience", 5)     
+        self.declare_parameter("min_goal_distance", 0.5)     
+                                                             
+                                                             
         self.declare_parameter("goal_clearance", 0.70)
-        # BEST-PRACTICE (Reachable-Frontier via Karten-Inflation):
-        #   Vor der Detektion belegte Zellen um diesen Radius verdicken;
-        #   Frontiers naeher als der Radius an einem Hindernis entstehen dann
-        #   nicht. Ersetzt konzeptionell die goal_clearance-Nachpruefung
-        #   (Senarathne 2015, Sun 2020). 0.0 = AUS -> bisheriges Verhalten.
-        #   Startwert = umschriebener Radius ~0.38 m.
         self.declare_parameter("reachability_inflation", 0.0)
-        # C: Obergrenze der Clearance-Tests pro Cluster (Rechenzeit-Deckel).
-        #   Kandidaten sind nach Abstand zum Zentroid sortiert; wer nach so vielen
-        #   Zellen keine freie gefunden hat, hat ein wandklebendes Cluster.
+
         self.declare_parameter("max_snap_candidates", 80)
-        # 3c:
-        self.declare_parameter("map_stability_tol", 50)      # Zellen: max. Aenderung bekannter Zellen, um als "stabil" zu gelten
-        # A:
-        self.declare_parameter("goal_timeout", 100.0)        # s: max. Zeit pro Explorations-Ziel, dann cancel+blacklist
+        self.declare_parameter("map_stability_tol", 50)      
+        self.declare_parameter("goal_timeout", 100.0)
 
         self.map_topic = self.get_parameter("map_topic").value
         self.marker_topic = self.get_parameter("marker_topic").value
@@ -143,43 +121,41 @@ class FrontierExplorer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
-        # Zustand
         self.state = STATE_IDLE
-        self.blacklist = []              # [(x, y)]
-        self.active_goal = None          # (x, y)
+        self.blacklist = []              
+        self.active_goal = None          
         self.current_goal_handle = None
         self.empty_count = 0
         self.goals_reached = 0
         self.shutting_down = False
-        self.latest_valid = []           # [(cx, cy, size, gx, gy)]
-        self.latest_robot = None         # (x, y)
-        # 3c: Karten-Stabilitaet
-        self.last_known_count = None     # Zahl bekannter Zellen im vorigen Update
-        self.map_is_stable = False       # True, wenn sich bekannte Zellen kaum aendern
-        # 3d: Return-to-Home
-        self.home_pose = None            # (x, y) beim ersten TF-Fix gemerkte Startpose
-        self.home_attempts = 0           # bereits unternommene Home-Zielversuche
-        # A: Ziel-Timeout
-        self.goal_start_time = None      # Zeitpunkt (Node-Clock), zu dem das aktive Ziel gesendet wurde
-        self.goal_timed_out = False      # True zwischen Timeout-Cancel und Result-Callback
-        # C: laufende Ziel-Revalidierung
-        self.goal_invalidated = False    # True zwischen Invalidierungs-Cancel und Result-Callback
-        self.invalid_reason = ""         # Grund, fuer die Logzeile
-        self._clear_offsets = None       # gecachte Kreisscheiben-Offsets fuer has_clearance
+        self.latest_valid = []           
+        self.latest_robot = None         
+        self.last_known_count = None     
+        self.map_is_stable = False       
+
+        self.home_pose = None           
+        self.home_attempts = 0           
+
+        self.goal_start_time = None      
+        self.goal_timed_out = False      
+
+        self.goal_invalidated = False    
+        self.invalid_reason = ""         
+        self._clear_offsets = None       
         self._clear_offsets_rad = -1
         # D: Fehlschlag-Zaehler je Zielort (10-cm-Raster)
         self.goal_failures = {}
-        # E: Metriken nach Expose 5.3 -- ALLE Zeiten in SIM-Zeit (nicht Wall-Time!)
-        self.t_start = None              # erster TF-Fix
-        self.t_explore_end = None        # 3c: Exploration abgeschlossen
-        self.t_home = None               # 3d: Home erreicht
-        self.dist_total = 0.0            # m, aus /odom integriert (Ground Truth)
-        self.dist_at_explore_end = None  # m, Schnappschuss bei 3c
+        
+        self.t_start = None              
+        self.t_explore_end = None        
+        self.t_home = None               
+        self.dist_total = 0.0            
+        self.dist_at_explore_end = None  
         self.last_odom_xy = None
-        self.n_revalidated = 0           # C: wie oft ein Ziel von der Karte entwertet wurde
-        self.n_retries = 0               # D: wie oft ein Ziel ohne Blacklist wiederholt wurde
-        self.n_timeouts = 0              # A: wie oft der Ziel-Timeout griff
-        self.rth_ok = None               # True/False, sobald entschieden
+        self.n_revalidated = 0           
+        self.n_retries = 0               
+        self.n_timeouts = 0              
+        self.rth_ok = None               
         self.eval_printed = False
 
         map_qos = QoSProfile(
