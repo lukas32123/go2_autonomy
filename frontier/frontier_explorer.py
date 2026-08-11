@@ -87,8 +87,8 @@ class FrontierExplorer(Node):
         self.declare_parameter("min_goal_distance", 0.5)     
                                                              
                                                              
-        self.declare_parameter("goal_clearance", 0.70)
-        self.declare_parameter("reachability_inflation", 0.0)
+        self.declare_parameter("goal_clearance", 0.0)
+        self.declare_parameter("reachability_inflation", 0.3)
 
         self.declare_parameter("max_snap_candidates", 80)
         self.declare_parameter("map_stability_tol", 50)      
