@@ -28,7 +28,7 @@ parser.add_argument("--cmd_timeout", type=float, default=0.5, help="Watchdog [s]
 parser.add_argument("--cmd_topic", type=str, default="/cmd_vel", help="Twist-Topic.")
 parser.add_argument("--laser_x", type=float, default=0.0, help="LiDAR-Mount x rel. base [m].")
 parser.add_argument("--laser_y", type=float, default=0.0, help="LiDAR-Mount y rel. base [m].")
-parser.add_argument("--laser_z", type=float, default=0.12, help="LiDAR-Mount z rel. base [m] (an realer Halterung messen).")
+parser.add_argument("--laser_z", type=float, default=0.4, help="LiDAR-Mount z rel. base [m] (an realer Halterung messen).")
 parser.add_argument(
     "--policy_path",
     type=str,
