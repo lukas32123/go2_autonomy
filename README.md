@@ -236,6 +236,21 @@ Karten und Messdateien sind Artefakte und liegen bewusst ausserhalb des Repos.
 
 ---
 
+## Reproduktion der Messreihe
+
+Die Auswertungsläufe entstanden auf dem Tag `v2.0-eval-final`. Auf diesem Stand
+trägt der Explorationsknoten die Vorgaben `goal_clearance=0.70` und
+`reachability_inflation=0.0`. Für die Versuchsreihe wurden beide beim Start
+übergeben.
+
+```bash
+python3 /root/repo/frontier/frontier_explorer.py --ros-args -p use_sim_time:=true \
+  -p goal_clearance:=0.0 -p reachability_inflation:=0.3
+```
+
+Der aktuelle Stand des Hauptzweigs trägt diese Werte bereits als Vorgabe. Dort
+genügt der einfache Start ohne die beiden Zusätze.
+
 ## Kernparameter (Stand der Messreihe)
 
 **Nav2** (`nav2_slam/nav2_go2.yaml`)
