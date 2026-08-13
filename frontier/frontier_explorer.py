@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Autonomer Frontier-Explorationsknoten fuer den Unitree Go2.
+"""
+Autonomer Frontier-Explorationsknoten fuer den Unitree Go2.
 
-Der Knoten liest die von der SLAM Toolbox gepflegte Belegungskarte, waehlt
-iterativ das guenstigste Grenzzellenziel und laesst es von Nav2 anfahren. Nach
+Der Knoten liest das Belegungsgitter, waehlt das guenstigste Grenzzellenziel und laesst es von Nav2 anfahren. Nach
 jeder Ankunft folgt das naechste Ziel, bis keine gueltige Grenze mehr existiert
 und die Karte stabil ist. Danach kehrt der Roboter zur gemerkten Startpose
 zurueck.
@@ -23,12 +23,14 @@ Nav2 ab. Der Ziel-Timeout verwirft ein Ziel, das zu lange aktiv bleibt, ohne
 erreicht zu werden. Die Abschlusspruefung verlangt vor der Rueckkehr eine ueber
 mehrere Aktualisierungen stabile Karte ohne gueltige Grenze.
 
-Verantwortlichkeiten sind auf eigene Klassen verteilt. ``FrontierDetector``
-gewinnt aus einer Karte die gueltigen Ziele. ``GoalSelector`` waehlt daraus das
-beste. ``Blacklist`` verwaltet gesperrte Orte und Wiederholzaehler.
+Verantwortlichkeiten sind auf eigene Klassen verteilt:
+
+``FrontierDetector`` gewinnt aus einer Karte die gueltigen Ziele. 
+``GoalSelector`` waehlt daraus das beste aus. 
+``Blacklist`` verwaltet gesperrte Orte und Wiederholzaehler.
 ``RunMetrics`` fuehrt Zeiten, Distanz und Zaehler und gibt die Auswertung aus.
-``MarkerPublisher`` erzeugt die Anzeige fuer RViz. ``FrontierExplorerNode``
-haelt den Zustandsautomaten und die Anbindung an ROS zusammen.
+``MarkerPublisher`` erzeugt die Anzeige fuer RViz. 
+``FrontierExplorerNode`` haelt den Zustandsautomaten und die Anbindung an ROS zusammen.
 
 Start im Container:
     python3 frontier_explorer.py --ros-args -p use_sim_time:=true
