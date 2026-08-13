@@ -1,42 +1,44 @@
 #!/usr/bin/env python3
-"""
-frontier_explorer.py — Stufe 3d + A: Autonomiezyklus komplett, mit Ziel-Timeout.
+"""Autonomer Frontier-Explorationsknoten fuer den Unitree Go2.
 
-Bachelorarbeit Go2 / Isaac Lab — Welt-2-Autonomieknoten, Sprosse 5 (Kern der Arbeit).
+Der Knoten liest die von der SLAM Toolbox gepflegte Belegungskarte, waehlt
+iterativ das guenstigste Grenzzellenziel und laesst es von Nav2 anfahren. Nach
+jeder Ankunft folgt das naechste Ziel, bis keine gueltige Grenze mehr existiert
+und die Karte stabil ist. Danach kehrt der Roboter zur gemerkten Startpose
+zurueck.
 
-Liest /map + Pose (TF), waehlt iterativ das beste Frontier-Ziel und schickt es an
-Nav2 (navigate_to_pose). Nach Ankunft wird automatisch das naechste Ziel gewaehlt,
-bis keine Frontiers mehr uebrig sind. Fehlgeschlagene Ziele -> Blacklist.
+Der Ablauf ist als Zustandsautomat organisiert.
 
-Zustandsautomat:
-  IDLE -> NAVIGATING -> (Ankunft) -> IDLE -> ...
-       -> (Frontiers erschoepft + Karte stabil) -> RETURNING -> (Home) -> DONE.
-  - Gesendet wird nur beim Uebergang nach NAVIGATING; waehrend der Fahrt bleibt
-    das Ziel fix (kein Zappeln).
-  - 3c-Abschluss: RETURNING nur, wenn ueber 'completion_patience' aufeinanderfolgende
-    Karten-Updates KEINE gueltige Frontier existiert UND die Karte in dieser Zeit
-    STABIL ist (Zahl bekannter Zellen aendert sich um < 'map_stability_tol').
-    Waechst/schwankt die Karte, wird der Abschlusszaehler zurueckgesetzt.
-  - 3d-Return-to-Home: Startpose beim ERSTEN gueltigen TF-Fix gemerkt (map-Frame);
-    nach Abschluss faehrt der Roboter dorthin zurueck (bestehende xy_goal_tolerance).
-    Scheitert das Home-Ziel, bis MAX_HOME_ATTEMPTS neu versuchen, dann aufgeben.
-  - A-Ziel-Timeout: Ist ein Explorations-Ziel laenger als 'goal_timeout' Sekunden
-    aktiv, ohne erreicht zu werden, wird es gecancelt, geblacklistet und das
-    naechste Ziel gewaehlt. Verhindert Endlos-Haenger an unerreichbaren Zielen
-    (z. B. Frontier im soliden Block). Gilt NUR fuer NAVIGATING, nicht fuer
-    RETURNING (das hat eigene Wiederhol-Logik).
-  - Beim Beenden (Strg-C) wird ein laufendes Ziel aktiv gecancelt.
+    IDLE -> NAVIGATING -> (Ankunft) -> IDLE -> ...
+         -> (Grenzen erschoepft und Karte stabil) -> RETURNING -> DONE
 
-Marker: gruene Zellen, orange Zentroide, roter Pfeil (bester Kandidat),
-goldene Saeule (aktives Ziel; in RETURNING = Home). Farben bewusst != Costmap.
+Ein Ziel wird nur beim Uebergang nach NAVIGATING gesendet. Waehrend der Fahrt
+bleibt es fest, damit der Roboter nicht zwischen Zielen pendelt.
 
-Start (im Container welt2):
-  python3 /root/frontier/frontier_explorer.py --ros-args -p use_sim_time:=true
+Vier Mechanismen sichern die Robustheit gegen unerreichbare oder entwertete
+Ziele. Die laufende Revalidierung bricht ein Ziel ab, dessen Zelle inzwischen
+belegt ist. Der einmalige Wiederholversuch faengt das Wettrennen zwischen der
+direkt gelesenen Karte und der etwas spaeter aktualisierten Kostenkarte von
+Nav2 ab. Der Ziel-Timeout verwirft ein Ziel, das zu lange aktiv bleibt, ohne
+erreicht zu werden. Die Abschlusspruefung verlangt vor der Rueckkehr eine ueber
+mehrere Aktualisierungen stabile Karte ohne gueltige Grenze.
+
+Verantwortlichkeiten sind auf eigene Klassen verteilt. ``FrontierDetector``
+gewinnt aus einer Karte die gueltigen Ziele. ``GoalSelector`` waehlt daraus das
+beste. ``Blacklist`` verwaltet gesperrte Orte und Wiederholzaehler.
+``RunMetrics`` fuehrt Zeiten, Distanz und Zaehler und gibt die Auswertung aus.
+``MarkerPublisher`` erzeugt die Anzeige fuer RViz. ``FrontierExplorerNode``
+haelt den Zustandsautomaten und die Anbindung an ROS zusammen.
+
+Start im Container:
+    python3 frontier_explorer.py --ros-args -p use_sim_time:=true
 """
 
 import sys
 import math
 from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -65,191 +67,191 @@ STATE_NAVIGATING = "NAVIGATING"
 STATE_RETURNING = "RETURNING"
 STATE_DONE = "DONE"
 
-MAX_HOME_ATTEMPTS = 3   
-MAX_GOAL_ATTEMPTS = 2   
+MAX_HOME_ATTEMPTS = 3
+MAX_GOAL_ATTEMPTS = 2
 
 
-class FrontierExplorer(Node):
-    def __init__(self):
-        super().__init__("frontier_explorer")
+# ======================================================================
+# Konfiguration
+# ======================================================================
+@dataclass
+class ExplorerConfig:
+    """Sammelt die ueber ROS-Parameter einstellbaren Groessen an einem Ort."""
 
-        self.declare_parameter("map_topic", "/map")
-        self.declare_parameter("marker_topic", "/frontiers")
-        self.declare_parameter("min_cluster_size", 5)
-        self.declare_parameter("occupied_threshold", 65)
-        self.declare_parameter("connectivity", 8)
-        self.declare_parameter("max_occupied_neighbors", 0)
-        self.declare_parameter("global_frame", "map")
-        self.declare_parameter("robot_base_frame", "base_link")
-        self.declare_parameter("size_weight", 0.05)
-        self.declare_parameter("blacklist_radius", 0.5)      
-        self.declare_parameter("completion_patience", 5)     
-        self.declare_parameter("min_goal_distance", 0.5)     
-                                                             
-                                                             
-        self.declare_parameter("goal_clearance", 0.0)
-        self.declare_parameter("reachability_inflation", 0.3)
+    map_topic: str
+    marker_topic: str
+    min_cluster_size: int
+    occupied_threshold: int
+    max_occ_nbr: int
+    global_frame: str
+    robot_base_frame: str
+    size_weight: float
+    blacklist_radius: float
+    completion_patience: int
+    min_goal_distance: float
+    goal_clearance: float
+    reach_infl: float
+    max_snap_candidates: int
+    map_stability_tol: int
+    goal_timeout: float
+    nbrs: Tuple[Tuple[int, int], ...]
 
-        self.declare_parameter("max_snap_candidates", 80)
-        self.declare_parameter("map_stability_tol", 50)      
-        self.declare_parameter("goal_timeout", 100.0)
+    @classmethod
+    def from_node(cls, node: Node) -> "ExplorerConfig":
+        """Deklariert die Parameter am Knoten und liest sie in eine Konfiguration."""
+        node.declare_parameter("map_topic", "/map")
+        node.declare_parameter("marker_topic", "/frontiers")
+        node.declare_parameter("min_cluster_size", 5)
+        node.declare_parameter("occupied_threshold", 65)
+        node.declare_parameter("connectivity", 8)
+        node.declare_parameter("max_occupied_neighbors", 0)
+        node.declare_parameter("global_frame", "map")
+        node.declare_parameter("robot_base_frame", "base_link")
+        node.declare_parameter("size_weight", 0.05)
+        node.declare_parameter("blacklist_radius", 0.5)
+        node.declare_parameter("completion_patience", 5)
+        node.declare_parameter("min_goal_distance", 0.5)
+        node.declare_parameter("goal_clearance", 0.0)
+        node.declare_parameter("reachability_inflation", 0.3)
+        node.declare_parameter("max_snap_candidates", 80)
+        node.declare_parameter("map_stability_tol", 50)
+        node.declare_parameter("goal_timeout", 100.0)
 
-        self.map_topic = self.get_parameter("map_topic").value
-        self.marker_topic = self.get_parameter("marker_topic").value
-        self.min_cluster_size = int(self.get_parameter("min_cluster_size").value)
-        self.occupied_threshold = int(self.get_parameter("occupied_threshold").value)
-        self.max_occ_nbr = int(self.get_parameter("max_occupied_neighbors").value)
-        self.global_frame = self.get_parameter("global_frame").value
-        self.robot_base_frame = self.get_parameter("robot_base_frame").value
-        self.size_weight = float(self.get_parameter("size_weight").value)
-        self.blacklist_radius = float(self.get_parameter("blacklist_radius").value)
-        self.completion_patience = int(self.get_parameter("completion_patience").value)
-        self.min_goal_distance = float(self.get_parameter("min_goal_distance").value)
-        self.goal_clearance = float(self.get_parameter("goal_clearance").value)
-        self.reach_infl = float(self.get_parameter("reachability_inflation").value)
-        self.max_snap_candidates = int(self.get_parameter("max_snap_candidates").value)
-        self.map_stability_tol = int(self.get_parameter("map_stability_tol").value)
-        self.goal_timeout = float(self.get_parameter("goal_timeout").value)
-        conn = int(self.get_parameter("connectivity").value)
+        conn = int(node.get_parameter("connectivity").value)
         if conn == 4:
-            self.nbrs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+            nbrs = ((1, 0), (-1, 0), (0, 1), (0, -1))
         else:
-            self.nbrs = ((1, 0), (-1, 0), (0, 1), (0, -1),
-                         (1, 1), (1, -1), (-1, 1), (-1, -1))
+            nbrs = ((1, 0), (-1, 0), (0, 1), (0, -1),
+                    (1, 1), (1, -1), (-1, 1), (-1, -1))
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        return cls(
+            map_topic=node.get_parameter("map_topic").value,
+            marker_topic=node.get_parameter("marker_topic").value,
+            min_cluster_size=int(node.get_parameter("min_cluster_size").value),
+            occupied_threshold=int(node.get_parameter("occupied_threshold").value),
+            max_occ_nbr=int(node.get_parameter("max_occupied_neighbors").value),
+            global_frame=node.get_parameter("global_frame").value,
+            robot_base_frame=node.get_parameter("robot_base_frame").value,
+            size_weight=float(node.get_parameter("size_weight").value),
+            blacklist_radius=float(node.get_parameter("blacklist_radius").value),
+            completion_patience=int(node.get_parameter("completion_patience").value),
+            min_goal_distance=float(node.get_parameter("min_goal_distance").value),
+            goal_clearance=float(node.get_parameter("goal_clearance").value),
+            reach_infl=float(node.get_parameter("reachability_inflation").value),
+            max_snap_candidates=int(node.get_parameter("max_snap_candidates").value),
+            map_stability_tol=int(node.get_parameter("map_stability_tol").value),
+            goal_timeout=float(node.get_parameter("goal_timeout").value),
+            nbrs=nbrs,
+        )
 
-        self.state = STATE_IDLE
-        self.blacklist = []              
-        self.active_goal = None          
-        self.current_goal_handle = None
-        self.empty_count = 0
-        self.goals_reached = 0
-        self.shutting_down = False
-        self.latest_valid = []           
-        self.latest_robot = None         
-        self.last_known_count = None     
-        self.map_is_stable = False       
 
-        self.home_pose = None           
-        self.home_attempts = 0           
+# ======================================================================
+# Wahrnehmung
+# ======================================================================
+@dataclass
+class DetectionResult:
+    """Ergebnis einer Kartenauswertung.
 
-        self.goal_start_time = None      
-        self.goal_timed_out = False      
+    ``frontier`` ist die Zellmaske der Grenzzellen, ``n_cells`` ihre Anzahl,
+    ``known`` die Zahl bekannter Zellen fuer die Stabilitaetspruefung, ``valid``
+    die Liste anfahrbarer Ziele als ``(cx, cy, n, gx, gy)`` und
+    ``skipped_clear`` die Zahl der wegen fehlenden Wandabstands verworfenen
+    Cluster.
+    """
 
-        self.goal_invalidated = False    
-        self.invalid_reason = ""         
-        self._clear_offsets = None       
+    frontier: bytearray
+    n_cells: int
+    known: int
+    valid: List[Tuple[float, float, int, float, float]]
+    skipped_clear: int
+
+
+class FrontierDetector:
+    """Gewinnt aus einer Belegungskarte die anfahrbaren Grenzzellenziele.
+
+    Der Ablauf verdickt zuerst die Hindernisse, markiert dann die Grenzzellen,
+    gruppiert sie und waehlt je Gruppe eine Zielzelle mit ausreichendem
+    Wandabstand.
+    """
+
+    def __init__(self, config: ExplorerConfig):
+        self.config = config
+        self._clear_offsets = None
         self._clear_offsets_rad = -1
-        # D: Fehlschlag-Zaehler je Zielort (10-cm-Raster)
-        self.goal_failures = {}
-        
-        self.t_start = None              
-        self.t_explore_end = None        
-        self.t_home = None               
-        self.dist_total = 0.0            
-        self.dist_at_explore_end = None  
-        self.last_odom_xy = None
-        self.n_revalidated = 0           
-        self.n_retries = 0               
-        self.n_timeouts = 0              
-        self.rth_ok = None               
-        self.eval_printed = False
-
-        map_qos = QoSProfile(
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        self.sub = self.create_subscription(
-            OccupancyGrid, self.map_topic, self.map_cb, map_qos
-        )
-        # E: gefahrene Distanz aus /odom integrieren (Ground Truth, voller Takt).
-        #    Ueber TF/Karten-Updates (0.5 Hz) waere die Strecke stark unterschaetzt.
-        self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_cb, 20)
-        self.pub = self.create_publisher(MarkerArray, self.marker_topic, 1)
-
-        # A: 1-Hz-Timer prueft den Ziel-Timeout (nutzt Node-Clock -> sim time)
-        self.timeout_timer = self.create_timer(1.0, self.check_goal_timeout)
-
-        self.get_logger().info(
-            f"[3d] Autonomiezyklus aktiv: sub '{self.map_topic}', pub '{self.marker_topic}'; "
-            f"size_weight={self.size_weight}, blacklist_radius={self.blacklist_radius}, "
-            f"min_goal_distance={self.min_goal_distance}, goal_clearance={self.goal_clearance}, "
-            f"max_goal_attempts={MAX_GOAL_ATTEMPTS}, revalidierung=an, "
-            f"completion_patience={self.completion_patience}, "
-            f"map_stability_tol={self.map_stability_tol}, goal_timeout={self.goal_timeout}s, "
-            f"frames {self.global_frame}->{self.robot_base_frame}"
-        )
 
     # ------------------------------------------------------------------
-    def map_cb(self, msg: OccupancyGrid):
-        w = msg.info.width
-        h = msg.info.height
-        res = msg.info.resolution
-        ox = msg.info.origin.position.x
-        oy = msg.info.origin.position.y
-        data = msg.data
+    def clearance_offsets(self, rad):
+        """Kreisscheibe von Zelloffsets, nach Abstand aufsteigend, gecacht.
 
-        if w == 0 or h == 0 or len(data) != w * h:
-            self.get_logger().warn(
-                f"Karte uebersprungen (malformed): width={w} height={h} data={len(data)}",
-                throttle_duration_sec=5.0,
-            )
-            return
+        Die aufsteigende Ordnung laesst die Freiraumpruefung im Ablehnungsfall
+        frueh abbrechen, da eine stoerende Wand meist nah liegt.
+        """
+        if rad != self._clear_offsets_rad:
+            r2 = rad * rad
+            offs = [(dc, dr)
+                    for dr in range(-rad, rad + 1)
+                    for dc in range(-rad, rad + 1)
+                    if dc * dc + dr * dr <= r2]
+            offs.sort(key=lambda o: o[0] * o[0] + o[1] * o[1])
+            self._clear_offsets = tuple(offs)
+            self._clear_offsets_rad = rad
+        return self._clear_offsets
 
-        # --- 1) Frontier-Zellen (+ Zahl bekannter Zellen fuer 3c) ---
+    def has_clearance(self, data, w, h, c0, r0, rad, occ):
+        """Prueft, ob im Zellradius um ``(c0, r0)`` keine belegte Zelle liegt.
+
+        Der Radius entspricht dem Aufblaehungsradius der Kostenkarte. Innerhalb
+        dieses Radius drueckt der Regler den Roboter von der Wand weg, sodass
+        die verbleibenden Fahrbefehle unter der Ansprechschwelle der gelernten
+        Lauffortbewegung liegen und der Roboter stehen bleibt. Solche Ziele
+        werden deshalb gar nicht erst erzeugt.
+
+        Unbekannte Zellen zaehlen nicht als Hindernis. Andernfalls haette keine
+        Grenzzelle je Freiraum. Die verbleibende Luecke gegen eine zum
+        Wahlzeitpunkt noch unbekannte Wand schliesst die laufende Revalidierung.
+        """
+        if rad <= 0:
+            return True
+        for (dc, dr) in self.clearance_offsets(rad):
+            rr = r0 + dr
+            if rr < 0 or rr >= h:
+                continue
+            cc = c0 + dc
+            if cc < 0 or cc >= w:
+                continue
+            if data[rr * w + cc] >= occ:
+                return False
+        return True
+
+    def _clear_radius(self, res):
+        """Wandabstand ``goal_clearance`` in Zellen der aktuellen Aufloesung."""
+        if self.config.goal_clearance > 0.0:
+            return int(math.ceil(self.config.goal_clearance / res))
+        return 0
+
+    # ------------------------------------------------------------------
+    def detect(self, data, w, h, res, ox, oy) -> DetectionResult:
+        """Wertet eine Karte vollstaendig aus und liefert die gueltigen Ziele."""
+        occ = self.config.occupied_threshold
+        max_occ = self.config.max_occ_nbr
+        nbrs = self.config.nbrs
+
         frontier = bytearray(w * h)
-        occ = self.occupied_threshold
-        max_occ = self.max_occ_nbr
-        nbrs = self.nbrs
         known = 0
 
-        # --- BEST-PRACTICE: belegte Zellen um reach_infl verdicken -----------
-        # blocked[i] = 1, wenn Zelle i belegt ODER innerhalb reach_infl um eine
-        # belegte Zelle. Solche Zellen werden bei der Detektion wie Hindernis
-        # behandelt -> Frontiers in zu engen Luecken entstehen nicht.
-        # reach_infl <= 0 -> blocked=None -> exakt bisheriges Verhalten.
-        infl_cells = int(math.ceil(self.reach_infl / res)) if self.reach_infl > 0.0 else 0
-        if infl_cells > 0:
-            blocked = bytearray(w * h)
-            ring = []
-            for i in range(w * h):
-                if data[i] >= occ and data[i] >= 0:
-                    blocked[i] = 1
-                    ring.append(i)
-            for _ in range(infl_cells):
-                nxt = []
-                for idx in ring:
-                    r = idx // w
-                    c = idx % w
-                    for dc, dr in nbrs:
-                        nc = c + dc
-                        nr = r + dr
-                        if 0 <= nc < w and 0 <= nr < h:
-                            nidx = nr * w + nc
-                            if not blocked[nidx]:
-                                blocked[nidx] = 1
-                                nxt.append(nidx)
-                ring = nxt
-        else:
-            blocked = None
-        # --------------------------------------------------------------------
+        blocked = self._inflate(data, w, h, res, occ, nbrs)
 
         for row in range(h):
             base = row * w
             for col in range(w):
                 v = data[base + col]
                 if v < 0:
-                    continue          # unbekannt -> nicht bekannt, keine Frontier
-                known += 1             # frei oder belegt = bekannt (3c)
+                    continue
+                known += 1
                 if v >= occ:
-                    continue          # belegt -> keine Frontier-Kandidatin
+                    continue
                 if blocked is not None and blocked[base + col]:
-                    continue          # BEST-PRACTICE: in Inflationszone -> keine Frontier
+                    continue
                 has_unknown = False
                 occ_count = 0
                 for dc, dr in nbrs:
@@ -266,14 +268,45 @@ class FrontierExplorer(Node):
 
         n_cells = sum(frontier)
 
-        # --- 3c) Karten-Stabilitaet: aendern sich bekannte Zellen kaum? ---
-        if self.last_known_count is None:
-            self.map_is_stable = False
-        else:
-            self.map_is_stable = abs(known - self.last_known_count) <= self.map_stability_tol
-        self.last_known_count = known
+        clusters = self._cluster(frontier, w, h, nbrs)
+        valid, skipped_clear = self._filter(clusters, data, w, h, res, ox, oy, occ)
 
-        # --- 2) Clustering (BFS) ---
+        return DetectionResult(frontier, n_cells, known, valid, skipped_clear)
+
+    def _inflate(self, data, w, h, res, occ, nbrs):
+        """Verdickt belegte Zellen um ``reachability_inflation``.
+
+        Eine so markierte Zelle gilt bei der Detektion als Hindernis, sodass in
+        zu engen Luecken keine Grenzzellen entstehen. Bei nicht positiver
+        Aufblaehung entfaellt die Maske und das Verhalten bleibt unveraendert.
+        """
+        infl_cells = int(math.ceil(self.config.reach_infl / res)) if self.config.reach_infl > 0.0 else 0
+        if infl_cells <= 0:
+            return None
+        blocked = bytearray(w * h)
+        ring = []
+        for i in range(w * h):
+            if data[i] >= occ and data[i] >= 0:
+                blocked[i] = 1
+                ring.append(i)
+        for _ in range(infl_cells):
+            nxt = []
+            for idx in ring:
+                r = idx // w
+                c = idx % w
+                for dc, dr in nbrs:
+                    nc = c + dc
+                    nr = r + dr
+                    if 0 <= nc < w and 0 <= nr < h:
+                        nidx = nr * w + nc
+                        if not blocked[nidx]:
+                            blocked[nidx] = 1
+                            nxt.append(nidx)
+            ring = nxt
+        return blocked
+
+    def _cluster(self, frontier, w, h, nbrs):
+        """Gruppiert zusammenhaengende Grenzzellen ueber eine Breitensuche."""
         clusters = []
         visited = bytearray(w * h)
         for start in range(w * h):
@@ -295,14 +328,21 @@ class FrontierExplorer(Node):
                                 visited[nidx] = 1
                                 q.append(nidx)
                 clusters.append(comp)
+        return clusters
 
-        # --- 3) Filtern -> Zentrum + Snap ---
+    def _filter(self, clusters, data, w, h, res, ox, oy, occ):
+        """Waehlt je Cluster den Zentroid und die naechste anfahrbare Zelle.
+
+        Verworfen werden Cluster unter der Mindestgroesse sowie solche, in denen
+        keine Zelle den geforderten Wandabstand hat. Letztere sind Wandartefakte
+        aus Winkelluecken des Laserscanners.
+        """
         valid = []
-        skipped_clear = 0          # B: Cluster ohne einnehmbare Zielzelle (Wand-Artefakte)
-        clear_r = int(math.ceil(self.goal_clearance / res)) if self.goal_clearance > 0.0 else 0
+        skipped_clear = 0
+        clear_r = self._clear_radius(res)
         for comp in clusters:
             n = len(comp)
-            if n < self.min_cluster_size:
+            if n < self.config.min_cluster_size:
                 continue
             sx = sy = 0.0
             cand = []
@@ -316,215 +356,505 @@ class FrontierExplorer(Node):
                 sy += py
             cx = sx / n
             cy = sy / n
-            # B: Snap = naechste Zelle zum Zentroid, die genug Wandabstand hat.
-            #    Bei clear_r == 0 ist das exakt das alte Verhalten (naechste Zelle).
             cand.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
             goal = None
-            for (px, py, c, r) in cand[: self.max_snap_candidates]:
+            for (px, py, c, r) in cand[: self.config.max_snap_candidates]:
                 if self.has_clearance(data, w, h, c, r, clear_r, occ):
                     goal = (px, py)
                     break
             if goal is None:
-                skipped_clear += 1   # keine Zelle im Cluster ist fuer den Footprint
-                continue             # einnehmbar -> Wand-Artefakt, verwerfen
+                skipped_clear += 1
+                continue
             valid.append((cx, cy, n, goal[0], goal[1]))
-
-        # --- 4) Pose (TF) ---
-        robot = None
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.global_frame, self.robot_base_frame, Time()
-            )
-            robot = (tf.transform.translation.x, tf.transform.translation.y)
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(
-                f"TF {self.global_frame}->{self.robot_base_frame} nicht verfuegbar: {e}",
-                throttle_duration_sec=5.0,
-            )
-
-        self.latest_valid = valid
-        self.latest_robot = robot
-
-        # --- 3d) Home-Pose einmalig beim ersten gueltigen TF-Fix merken ---
-        # (passiert vor dem ersten Ziel -> tatsaechliche Startpose im map-Frame)
-        if self.home_pose is None and robot is not None:
-            self.home_pose = robot
-            self.t_start = self.get_clock().now()      # E: Startzeit (Sim)
-            self.dist_total = 0.0                      # E: Zaehler auf 0
-            self.get_logger().info(
-                f"[3d] Home-Pose gemerkt (Startpose): ({robot[0]:.2f}, {robot[1]:.2f})."
-            )
-
-        best = self.select_best(valid, robot)
-
-        sizes = sorted((v[2] for v in valid), reverse=True)
-        self.get_logger().info(
-            f"[{self.state}] Frontiers: {n_cells} Zellen | {len(valid)} gueltig | "
-            f"{skipped_clear} verworfen (Clearance) | "
-            f"Groessen={sizes[:5]} | Karte={'stabil' if self.map_is_stable else 'waechst'} | "
-            f"Blacklist={len(self.blacklist)} | Ziele erreicht={self.goals_reached}"
-        )
-
-        self.publish_markers(msg.header, frontier, w, h, res, ox, oy, valid, best)
-
-        # --- 5) C: aktives Ziel gegen die AKTUELLE Karte pruefen ---
-        if self.state == STATE_NAVIGATING and not self.goal_invalidated:
-            if not self.goal_still_valid(data, w, h, res, ox, oy, occ, clear_r):
-                self.abort_goal_invalid()
-                return
-
-        # --- 6) Zyklus: nur im IDLE ein neues Ziel waehlen/senden ---
-        if self.state == STATE_IDLE:
-            self.try_select_and_send()
+        return valid, skipped_clear
 
     # ------------------------------------------------------------------
-    # E: Distanzintegration (Expose 5.3 "zurueckgelegte Distanz")
-    def odom_cb(self, msg):
-        p = msg.pose.pose.position
-        xy = (p.x, p.y)
-        if self.last_odom_xy is not None:
-            dx = xy[0] - self.last_odom_xy[0]
-            dy = xy[1] - self.last_odom_xy[1]
-            step = math.hypot(dx, dy)
-            if step < 0.5:               # > 0.5 m in einem Takt = Glitch, ignorieren
-                self.dist_total += step
-        self.last_odom_xy = xy
+    def goal_validity(self, data, w, h, res, ox, oy, occ, active_goal) -> Optional[str]:
+        """Prueft das aktive Ziel gegen die aktuelle Karte.
 
-    # ------------------------------------------------------------------
-    def is_blacklisted(self, gx, gy):
-        r2 = self.blacklist_radius ** 2
-        for (bx, by) in self.blacklist:
+        Ein Grenzziel liegt an der Grenze zum Unbekannten. Waehrend der Anfahrt
+        kann dort eine Wand sichtbar werden. Nav2 haelt dann am Ziel fest und der
+        Roboter bleibt vor dem Kostenberg stehen. Gibt den Grund der
+        Ungueltigkeit zurueck, sonst ``None``.
+        """
+        if active_goal is None:
+            return None
+        gx, gy = active_goal
+        c = int((gx - ox) / res)
+        r = int((gy - oy) / res)
+        if c < 0 or c >= w or r < 0 or r >= h:
+            return None
+        if data[r * w + c] >= occ:
+            return "Zielzelle ist inzwischen BELEGT"
+        if not self.has_clearance(data, w, h, c, r, self._clear_radius(res), occ):
+            return (f"Wandabstand unter goal_clearance "
+                    f"({self.config.goal_clearance:.2f} m) gefallen")
+        return None
+
+
+# ======================================================================
+# Zielsperren und Zielauswahl
+# ======================================================================
+class Blacklist:
+    """Verwaltet gesperrte Zielorte und die Wiederholzaehler je Ort.
+
+    Ein Ort wird gesperrt, sobald ein Ziel endgueltig scheitert. Der
+    Wiederholzaehler auf einem Zehn-Zentimeter-Raster erlaubt einen einzigen
+    erneuten Versuch, bevor gesperrt wird.
+    """
+
+    def __init__(self, radius: float, max_attempts: int):
+        self.radius = radius
+        self.max_attempts = max_attempts
+        self._blocked: List[Tuple[float, float]] = []
+        self._failures = {}
+
+    def contains(self, gx, gy) -> bool:
+        """True, wenn ``(gx, gy)`` innerhalb des Sperrradius eines Orts liegt."""
+        r2 = self.radius ** 2
+        for (bx, by) in self._blocked:
             if (gx - bx) ** 2 + (gy - by) ** 2 <= r2:
                 return True
         return False
 
-    def clearance_offsets(self, rad):
-        """C: Kreisscheiben-Offsets, nach Abstand aufsteigend, gecacht.
+    def add(self, goal):
+        """Sperrt einen Zielort."""
+        if goal is not None:
+            self._blocked.append(goal)
 
-        Aufsteigend, weil eine Wand meist NAH ist, wenn sie ueberhaupt stoert --
-        so bricht has_clearance im Ablehnungsfall so frueh wie moeglich ab.
-        """
-        if rad != self._clear_offsets_rad:
-            r2 = rad * rad
-            offs = [(dc, dr)
-                    for dr in range(-rad, rad + 1)
-                    for dc in range(-rad, rad + 1)
-                    if dc * dc + dr * dr <= r2]
-            offs.sort(key=lambda o: o[0] * o[0] + o[1] * o[1])
-            self._clear_offsets = tuple(offs)
-            self._clear_offsets_rad = rad
-        return self._clear_offsets
-
-    def has_clearance(self, data, w, h, c0, r0, rad, occ):
-        """B/C: True, wenn im Zellradius 'rad' um (c0, r0) keine BELEGTE Zelle liegt.
-
-        Warum 0.70 m (= inflation_radius aus nav2_go2.yaml): Der InflationLayer setzt
-        JENSEITS dieses Radius Kosten 0. Innerhalb steigen sie exponentiell (bei 0.35 m
-        noch ~140). MPPI wird dort vom CostCritic von der Wand weggedrueckt, waehrend der
-        GoalCritic hinzieht -- Ergebnis sind Befehle wie vx=0.06 m/s. Gemessen: unterhalb
-        von ~0.08 m/s setzt die gelernte Policy KEINEN Fuss (Totbereich). Der Roboter
-        steht, Nav2 meldet "Failed to make progress", der BT retryt endlos.
-        Also: solche Ziele gar nicht erst erzeugen.
-
-        UNBEKANNTE Zellen (< 0) zaehlen NICHT als Hindernis -- sonst haette per
-        Definition keine einzige Frontier-Zelle jemals Clearance. Genau daraus folgt
-        aber die Restluecke, die goal_still_valid() schliesst: gegen eine Wand, die
-        beim Zielwahl-Zeitpunkt noch UNBEKANNT ist, kann dieser Filter nichts tun.
-        """
-        if rad <= 0:
-            return True                      # Filter aus -> altes Verhalten
-        for (dc, dr) in self.clearance_offsets(rad):
-            rr = r0 + dr
-            if rr < 0 or rr >= h:
-                continue                     # Kartenrand ist kein Hindernis
-            cc = c0 + dc
-            if cc < 0 or cc >= w:
-                continue
-            if data[rr * w + cc] >= occ:
-                return False
-        return True
-
-    # ------------------------------------------------------------------
-    # C: Laufende Revalidierung des AKTIVEN Ziels
-    def goal_still_valid(self, data, w, h, res, ox, oy, occ, clear_r):
-        """C: Ist das aktive Ziel auf der AKTUELLEN Karte noch anfahrbar?
-
-        Ein Frontier-Ziel liegt per Definition an der Grenze zum Unbekannten. Waehrend
-        der Anfahrt kann dort eine Wand auftauchen -- real beobachtet: Ziel (-3.03, -0.89)
-        lag 3 cm vor der Innenblock-Wand (x = -3.00), die zum Wahlzeitpunkt unbekannt war.
-        Nav2 haelt stur am Ziel fest (Restpfad sprang von 2 m auf 9.9 m), MPPI steckt im
-        Kostenberg fest, der Roboter steht 80 s. Deshalb: bei jedem Karten-Update pruefen.
-        """
-        if self.active_goal is None:
-            return True
-        gx, gy = self.active_goal
-        c = int((gx - ox) / res)
-        r = int((gy - oy) / res)
-        if c < 0 or c >= w or r < 0 or r >= h:
-            return True          # ausserhalb der Karte -> nicht beurteilbar
-        if data[r * w + c] >= occ:
-            self.invalid_reason = "Zielzelle ist inzwischen BELEGT"
-            return False
-        if not self.has_clearance(data, w, h, c, r, clear_r, occ):
-            self.invalid_reason = (
-                f"Wandabstand unter goal_clearance ({self.goal_clearance:.2f} m) gefallen"
-            )
-            return False
-        return True
-
-    def abort_goal_invalid(self):
-        """C: Aktives Ziel abbrechen -- OHNE Blacklist.
-
-        Bewusst keine Blacklist: Der Cluster als solcher bleibt gueltig. Die Wand ist
-        jetzt BEKANNT, also verwirft der Snap beim naechsten Update die wandnahen Zellen
-        von selbst und waehlt eine mit Abstand. Blacklisten wuerde die Region unnoetig
-        aufgeben -- genau der Fehler, der in Lauf B eine Kartenluecke hinterliess.
-        """
-        self.get_logger().warn(
-            f"[C] Ziel {self.active_goal} ist ungueltig geworden: {self.invalid_reason} "
-            f"-> abbrechen, Neuwahl (KEINE Blacklist)."
-        )
-        self.goal_invalidated = True
-        self.n_revalidated += 1                        # E
-        if self.current_goal_handle is not None:
-            self.current_goal_handle.cancel_goal_async()
-        else:
-            self.state = STATE_IDLE
-
-    def goal_key(self, goal):
-        """D: Zielort auf 10-cm-Raster -- 'derselbe Ort' trotz Snap-Jitter."""
+    def key(self, goal):
+        """Bildet einen Zielort auf ein Zehn-Zentimeter-Raster ab."""
         if goal is None:
             return None
         return (round(goal[0], 1), round(goal[1], 1))
 
+    def register_failure(self, key) -> int:
+        """Zaehlt einen Fehlschlag am gerasterten Ort und gibt den Stand zurueck."""
+        self._failures[key] = self._failures.get(key, 0) + 1
+        return self._failures[key]
+
+    def __len__(self):
+        return len(self._blocked)
+
+
+class GoalSelector:
+    """Waehlt aus den gueltigen Zielen das guenstigste.
+
+    Die Kosten eines Ziels sind seine Entfernung, vermindert um die mit
+    ``size_weight`` gewichtete Clustergroesse. Zu nahe und gesperrte Ziele
+    entfallen.
+    """
+
+    def __init__(self, config: ExplorerConfig, blacklist: Blacklist):
+        self.config = config
+        self.blacklist = blacklist
+
     def select_best(self, valid, robot):
-        """Bestes nicht-blacklistetes Cluster (min Kosten), Ziel mind. min_goal_distance entfernt."""
+        """Guenstigstes nicht gesperrtes Ziel mit ausreichendem Abstand."""
         if robot is None or not valid:
             return None
         rx, ry = robot
         best = None
         best_cost = None
         for (cx, cy, n, gx, gy) in valid:
-            if self.is_blacklisted(gx, gy):
+            if self.blacklist.contains(gx, gy):
                 continue
             dist = math.hypot(gx - rx, gy - ry)
-            if dist < self.min_goal_distance:
+            if dist < self.config.min_goal_distance:
                 continue
-            cost = dist - self.size_weight * n
+            cost = dist - self.config.size_weight * n
             if best_cost is None or cost < best_cost:
                 best_cost = cost
                 yaw = math.atan2(gy - ry, gx - rx)
                 best = (gx, gy, n, dist, cost, yaw)
         return best
 
+
+# ======================================================================
+# Auswertung
+# ======================================================================
+class RunMetrics:
+    """Fuehrt Zeiten, gefahrene Distanz und Ereigniszaehler eines Laufs.
+
+    Die Distanz wird aus der Odometrie im vollen Takt integriert, da die
+    Kartenaktualisierung zu langsam ist, um die Strecke zu erfassen. Die
+    Auswertung wird am Ende als eine uebernehmbare Zeile ausgegeben.
+    """
+
+    def __init__(self):
+        self.goals_reached = 0
+        self.n_revalidated = 0
+        self.n_retries = 0
+        self.n_timeouts = 0
+        self.t_start = None
+        self.t_explore_end = None
+        self.t_home = None
+        self.dist_total = 0.0
+        self.dist_at_explore_end = None
+        self.last_odom_xy = None
+        self.rth_ok = None
+        self.eval_printed = False
+
+    def integrate_odom(self, position):
+        """Addiert die Schrittweite; verwirft unplausible Spruenge."""
+        xy = (position.x, position.y)
+        if self.last_odom_xy is not None:
+            dx = xy[0] - self.last_odom_xy[0]
+            dy = xy[1] - self.last_odom_xy[1]
+            step = math.hypot(dx, dy)
+            if step < 0.5:
+                self.dist_total += step
+        self.last_odom_xy = xy
+
+    def mark_start(self, now):
+        """Setzt den Startzeitpunkt und den Distanzzaehler zurueck."""
+        self.t_start = now
+        self.dist_total = 0.0
+
+    def mark_explore_end(self, now):
+        """Friert Zeit und Distanz am Ende der Explorationsphase ein."""
+        self.t_explore_end = now
+        self.dist_at_explore_end = self.dist_total
+
+    def mark_home(self, now, ok):
+        """Haelt Ankunftszeit und Erfolg der Rueckkehr fest."""
+        self.t_home = now
+        self.rth_ok = ok
+
+    def count_reached(self):
+        self.goals_reached += 1
+
+    def count_revalidate(self):
+        self.n_revalidated += 1
+
+    def count_retry(self):
+        self.n_retries += 1
+
+    def count_timeout(self):
+        self.n_timeouts += 1
+
+    def print_eval(self, logger, blacklist_size, config: ExplorerConfig):
+        """Gibt die Laufmetriken einmalig aus, inklusive der CSV-Zeile."""
+        if self.eval_printed:
+            return
+        self.eval_printed = True
+
+        def secs(a, b):
+            if a is None or b is None:
+                return None
+            return (b - a).nanoseconds / 1e9
+
+        t_expl = secs(self.t_start, self.t_explore_end)
+        t_rth = secs(self.t_explore_end, self.t_home)
+        t_ges = secs(self.t_start, self.t_home)
+        d_expl = self.dist_at_explore_end
+        d_rth = (self.dist_total - d_expl) if d_expl is not None else None
+        d_ges = self.dist_total
+
+        def f(v, nk=1):
+            return "n/a" if v is None else f"{v:.{nk}f}"
+
+        rth = {True: "ERFOLGREICH", False: "FEHLGESCHLAGEN"}.get(self.rth_ok, "ABGEBROCHEN")
+
+        L = logger
+        L.info("=" * 64)
+        L.info("[EVAL] LAUF-METRIKEN (Expose 5.3) -- ALLE ZEITEN IN SIM-ZEIT")
+        L.info("=" * 64)
+        L.info(f"[EVAL] Ziele erreicht         : {self.goals_reached}")
+        L.info(f"[EVAL] Explorationszeit       : {f(t_expl)} s")
+        L.info(f"[EVAL] Return-to-Home-Zeit    : {f(t_rth)} s")
+        L.info(f"[EVAL] Gesamtzeit             : {f(t_ges)} s")
+        L.info(f"[EVAL] Distanz Exploration    : {f(d_expl, 2)} m")
+        L.info(f"[EVAL] Distanz Return-to-Home : {f(d_rth, 2)} m")
+        L.info(f"[EVAL] Distanz gesamt         : {f(d_ges, 2)} m")
+        L.info(f"[EVAL] Return-to-Home         : {rth}")
+        L.info(f"[EVAL] Blacklist-Eintraege    : {blacklist_size}")
+        L.info(f"[EVAL] Ziel-Revalidierungen(C): {self.n_revalidated}")
+        L.info(f"[EVAL] Ziel-Retries (D)       : {self.n_retries}")
+        L.info(f"[EVAL] Ziel-Timeouts (A)      : {self.n_timeouts}")
+        L.info(f"[EVAL] Konfig                 : goal_clearance={config.goal_clearance} "
+               f"min_goal_distance={config.min_goal_distance} size_weight={config.size_weight}")
+        L.info(
+            "[EVAL] CSV;ziele;t_expl;t_rth;t_ges;d_expl;d_rth;d_ges;rth;blacklist;reval;retry;timeout;clearance"
+        )
+        L.info(
+            f"[EVAL] CSV;{self.goals_reached};{f(t_expl)};{f(t_rth)};{f(t_ges)};"
+            f"{f(d_expl, 2)};{f(d_rth, 2)};{f(d_ges, 2)};{rth};{blacklist_size};"
+            f"{self.n_revalidated};{self.n_retries};{self.n_timeouts};{config.goal_clearance}"
+        )
+        L.info("=" * 64)
+        L.info("[EVAL] HINWEIS: Karte JETZT sichern, solange SLAM laeuft:")
+        L.info("[EVAL]   ros2 run nav2_map_server map_saver_cli -f /root/maps/<name> -t /map")
+        L.info("=" * 64)
+
+
+# ======================================================================
+# Anzeige
+# ======================================================================
+class MarkerPublisher:
+    """Erzeugt die RViz-Anzeige aus Grenzzellen, Zentroiden und aktivem Ziel.
+
+    Die Farben sind bewusst von der Kostenkarte verschieden. Gruen sind die
+    Grenzzellen, orange die Zentroide, rot der beste Kandidat, gold das aktive
+    Ziel.
+    """
+
+    def __init__(self, publisher):
+        self.pub = publisher
+
+    def publish(self, header, frontier, w, h, res, ox, oy, valid, best, active_goal):
+        arr = MarkerArray()
+
+        cells = Marker()
+        cells.header = header
+        cells.ns = "frontier_cells"
+        cells.id = 0
+        cells.type = Marker.CUBE_LIST
+        cells.action = Marker.ADD
+        cells.scale.x = res
+        cells.scale.y = res
+        cells.scale.z = max(res * 0.2, 0.01)
+        cells.color = ColorRGBA(r=0.1, g=1.0, b=0.2, a=0.9)
+        cells.pose.orientation.w = 1.0
+        for idx in range(w * h):
+            if frontier[idx]:
+                r = idx // w
+                c = idx % w
+                cells.points.append(Point(x=ox + (c + 0.5) * res,
+                                          y=oy + (r + 0.5) * res, z=0.06))
+        arr.markers.append(cells)
+
+        cent = Marker()
+        cent.header = header
+        cent.ns = "frontier_centroids"
+        cent.id = 1
+        cent.type = Marker.SPHERE_LIST
+        cent.action = Marker.ADD
+        cent.scale.x = 0.15
+        cent.scale.y = 0.15
+        cent.scale.z = 0.15
+        cent.color = ColorRGBA(r=1.0, g=0.55, b=0.0, a=1.0)
+        cent.pose.orientation.w = 1.0
+        for cx, cy, n, gx, gy in valid:
+            cent.points.append(Point(x=cx, y=cy, z=0.15))
+        arr.markers.append(cent)
+
+        goal = Marker()
+        goal.header = header
+        goal.ns = "frontier_goal"
+        goal.id = 2
+        goal.type = Marker.ARROW
+        if best is not None:
+            gx, gy, n, dist, cost, yaw = best
+            goal.action = Marker.ADD
+            goal.scale.x = 0.5
+            goal.scale.y = 0.1
+            goal.scale.z = 0.1
+            goal.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+            goal.pose.position.x = gx
+            goal.pose.position.y = gy
+            goal.pose.position.z = 0.2
+            goal.pose.orientation.z = math.sin(yaw / 2.0)
+            goal.pose.orientation.w = math.cos(yaw / 2.0)
+        else:
+            goal.action = Marker.DELETE
+        arr.markers.append(goal)
+
+        act = Marker()
+        act.header = header
+        act.ns = "active_goal"
+        act.id = 3
+        act.type = Marker.CYLINDER
+        if active_goal is not None:
+            ax, ay = active_goal
+            act.action = Marker.ADD
+            act.scale.x = 0.2
+            act.scale.y = 0.2
+            act.scale.z = 0.8
+            act.color = ColorRGBA(r=1.0, g=0.85, b=0.0, a=0.85)
+            act.pose.position.x = ax
+            act.pose.position.y = ay
+            act.pose.position.z = 0.4
+            act.pose.orientation.w = 1.0
+        else:
+            act.action = Marker.DELETE
+        arr.markers.append(act)
+
+        self.pub.publish(arr)
+
+
+# ======================================================================
+# Zustandsautomat und ROS-Anbindung
+# ======================================================================
+class FrontierExplorerNode(Node):
+    """Haelt den Zustandsautomaten und die Anbindung an ROS zusammen.
+
+    Der Knoten abonniert Karte und Odometrie, fragt die Pose ueber TF ab und
+    steuert die Zielvergabe an Nav2. Die fachliche Arbeit delegiert er an
+    Detektor, Zielauswahl, Sperrliste, Metrik und Anzeige.
+    """
+
+    def __init__(self):
+        super().__init__("frontier_explorer")
+
+        self.config = ExplorerConfig.from_node(self)
+        self.detector = FrontierDetector(self.config)
+        self.blacklist = Blacklist(self.config.blacklist_radius, MAX_GOAL_ATTEMPTS)
+        self.selector = GoalSelector(self.config, self.blacklist)
+        self.metrics = RunMetrics()
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+
+        self.state = STATE_IDLE
+        self.active_goal = None
+        self.current_goal_handle = None
+        self.empty_count = 0
+        self.shutting_down = False
+        self.latest_valid = []
+        self.latest_robot = None
+        self.last_known_count = None
+        self.map_is_stable = False
+
+        self.home_pose = None
+        self.home_attempts = 0
+
+        self.goal_start_time = None
+        self.goal_timed_out = False
+
+        self.goal_invalidated = False
+        self.invalid_reason = ""
+
+        map_qos = QoSProfile(
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.sub = self.create_subscription(
+            OccupancyGrid, self.config.map_topic, self.map_cb, map_qos
+        )
+        self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_cb, 20)
+        self.pub = self.create_publisher(MarkerArray, self.config.marker_topic, 1)
+        self.markers = MarkerPublisher(self.pub)
+
+        self.timeout_timer = self.create_timer(1.0, self.check_goal_timeout)
+
+        self.get_logger().info(
+            f"[3d] Autonomiezyklus aktiv: sub '{self.config.map_topic}', pub '{self.config.marker_topic}'; "
+            f"size_weight={self.config.size_weight}, blacklist_radius={self.config.blacklist_radius}, "
+            f"min_goal_distance={self.config.min_goal_distance}, goal_clearance={self.config.goal_clearance}, "
+            f"max_goal_attempts={MAX_GOAL_ATTEMPTS}, revalidierung=an, "
+            f"completion_patience={self.config.completion_patience}, "
+            f"map_stability_tol={self.config.map_stability_tol}, goal_timeout={self.config.goal_timeout}s, "
+            f"frames {self.config.global_frame}->{self.config.robot_base_frame}"
+        )
+
+    # ------------------------------------------------------------------
+    def map_cb(self, msg: OccupancyGrid):
+        """Wertet eine Karte aus, aktualisiert Anzeige und Zielvergabe."""
+        w = msg.info.width
+        h = msg.info.height
+        res = msg.info.resolution
+        ox = msg.info.origin.position.x
+        oy = msg.info.origin.position.y
+        data = msg.data
+
+        if w == 0 or h == 0 or len(data) != w * h:
+            self.get_logger().warn(
+                f"Karte uebersprungen (malformed): width={w} height={h} data={len(data)}",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        result = self.detector.detect(data, w, h, res, ox, oy)
+
+        if self.last_known_count is None:
+            self.map_is_stable = False
+        else:
+            self.map_is_stable = abs(result.known - self.last_known_count) <= self.config.map_stability_tol
+        self.last_known_count = result.known
+
+        robot = None
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.config.global_frame, self.config.robot_base_frame, Time()
+            )
+            robot = (tf.transform.translation.x, tf.transform.translation.y)
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(
+                f"TF {self.config.global_frame}->{self.config.robot_base_frame} nicht verfuegbar: {e}",
+                throttle_duration_sec=5.0,
+            )
+
+        self.latest_valid = result.valid
+        self.latest_robot = robot
+
+        if self.home_pose is None and robot is not None:
+            self.home_pose = robot
+            self.metrics.mark_start(self.get_clock().now())
+            self.get_logger().info(
+                f"[3d] Home-Pose gemerkt (Startpose): ({robot[0]:.2f}, {robot[1]:.2f})."
+            )
+
+        best = self.selector.select_best(result.valid, robot)
+
+        sizes = sorted((v[2] for v in result.valid), reverse=True)
+        self.get_logger().info(
+            f"[{self.state}] Frontiers: {result.n_cells} Zellen | {len(result.valid)} gueltig | "
+            f"{result.skipped_clear} verworfen (Clearance) | "
+            f"Groessen={sizes[:5]} | Karte={'stabil' if self.map_is_stable else 'waechst'} | "
+            f"Blacklist={len(self.blacklist)} | Ziele erreicht={self.metrics.goals_reached}"
+        )
+
+        self.markers.publish(msg.header, result.frontier, w, h, res, ox, oy,
+                             result.valid, best, self.active_goal)
+
+        if self.state == STATE_NAVIGATING and not self.goal_invalidated:
+            reason = self.detector.goal_validity(
+                data, w, h, res, ox, oy, self.config.occupied_threshold, self.active_goal
+            )
+            if reason is not None:
+                self.invalid_reason = reason
+                self.abort_goal_invalid()
+                return
+
+        if self.state == STATE_IDLE:
+            self.try_select_and_send()
+
+    # ------------------------------------------------------------------
+    def odom_cb(self, msg):
+        """Integriert die gefahrene Distanz aus der Odometrie."""
+        self.metrics.integrate_odom(msg.pose.pose.position)
+
+    # ------------------------------------------------------------------
+    def abort_goal_invalid(self):
+        """Bricht ein entwertetes Ziel ab, ohne den Ort zu sperren.
+
+        Der Cluster bleibt gueltig. Die Wand ist nun bekannt, sodass die naechste
+        Auswertung die wandnahen Zellen von selbst verwirft. Eine Sperre wuerde
+        die Region unnoetig aufgeben.
+        """
+        self.get_logger().warn(
+            f"[C] Ziel {self.active_goal} ist ungueltig geworden: {self.invalid_reason} "
+            f"-> abbrechen, Neuwahl (KEINE Blacklist)."
+        )
+        self.goal_invalidated = True
+        self.metrics.count_revalidate()
+        if self.current_goal_handle is not None:
+            self.current_goal_handle.cancel_goal_async()
+        else:
+            self.state = STATE_IDLE
+
     def try_select_and_send(self):
+        """Waehlt im Leerlauf ein Ziel oder leitet den Abschluss ein."""
         if self.shutting_down or self.state != STATE_IDLE:
             return
-        best = self.select_best(self.latest_valid, self.latest_robot)
+        best = self.selector.select_best(self.latest_valid, self.latest_robot)
         if best is None:
             if self.latest_robot is None:
-                return  # Pose fehlt -> nicht als "fertig" werten
-            # 3c: nur auf STABILER Karte in Richtung Abschluss zaehlen.
+                return
             if not self.map_is_stable:
                 if self.empty_count > 0:
                     self.get_logger().info(
@@ -535,27 +865,26 @@ class FrontierExplorer(Node):
             self.empty_count += 1
             self.get_logger().info(
                 f"[3c] stabile Karte, keine gueltigen Frontiers "
-                f"({self.empty_count}/{self.completion_patience})."
+                f"({self.empty_count}/{self.config.completion_patience})."
             )
-            if self.empty_count >= self.completion_patience:
+            if self.empty_count >= self.config.completion_patience:
                 self.get_logger().info(
                     f"[3c] ===> EXPLORATION FERTIG: keine Frontiers mehr, Karte stabil ueber "
-                    f"{self.completion_patience} Updates. {self.goals_reached} Ziele erreicht. "
+                    f"{self.config.completion_patience} Updates. {self.metrics.goals_reached} Ziele erreicht. "
                     f"Starte Return-to-Home."
                 )
-                # E: Explorationsphase abgeschlossen -- Zeit und Distanz einfrieren
-                self.t_explore_end = self.get_clock().now()
-                self.dist_at_explore_end = self.dist_total
+                self.metrics.mark_explore_end(self.get_clock().now())
                 self.start_return_home()
             return
         self.empty_count = 0
         self.send_goal(best)
 
     def send_goal(self, best):
+        """Sendet ein Explorationsziel an Nav2 und wechselt nach NAVIGATING."""
         gx, gy, n, dist, cost, yaw = best
         goal_msg = NavigateToPose.Goal()
         ps = PoseStamped()
-        ps.header.frame_id = self.global_frame
+        ps.header.frame_id = self.config.global_frame
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose.position.x = gx
         ps.pose.position.y = gy
@@ -565,22 +894,22 @@ class FrontierExplorer(Node):
 
         self.state = STATE_NAVIGATING
         self.active_goal = (gx, gy)
-        # A: Startzeit des Ziels merken, Timeout-Flag zuruecksetzen
         self.goal_start_time = self.get_clock().now()
         self.goal_timed_out = False
         self.get_logger().info(
-            f"[3b] Ziel #{self.goals_reached + 1}: ({gx:.2f}, {gy:.2f}), "
+            f"[3b] Ziel #{self.metrics.goals_reached + 1}: ({gx:.2f}, {gy:.2f}), "
             f"Cluster {n} Zellen, Dist {dist:.2f} m -> NAVIGATING"
         )
         fut = self.nav_client.send_goal_async(goal_msg, feedback_callback=self.feedback_cb)
         fut.add_done_callback(self.goal_response_cb)
 
     def goal_response_cb(self, future):
+        """Behandelt die Annahme oder Ablehnung eines Explorationsziels."""
         gh = future.result()
         if not gh.accepted:
             self.get_logger().warn(f"[3b] Ziel ABGELEHNT -> Blacklist {self.active_goal}.")
             if self.active_goal is not None:
-                self.blacklist.append(self.active_goal)
+                self.blacklist.add(self.active_goal)
             self.current_goal_handle = None
             self.state = STATE_IDLE
             return
@@ -589,6 +918,7 @@ class FrontierExplorer(Node):
         res_fut.add_done_callback(self.result_cb)
 
     def feedback_cb(self, feedback_msg):
+        """Meldet die Restdistanz waehrend der Fahrt."""
         fb = feedback_msg.feedback
         self.get_logger().info(
             f"[{self.state}] unterwegs... Restdistanz {fb.distance_remaining:.2f} m",
@@ -596,26 +926,32 @@ class FrontierExplorer(Node):
         )
 
     def result_cb(self, future):
+        """Wertet das Ergebnis eines Explorationsziels aus.
+
+        Erfolg fuehrt zum naechsten Ziel. Ein durch Revalidierung oder Timeout
+        ausgeloester Abbruch wird gesondert behandelt. Ein Fehlschlag erhaelt
+        einen einzigen Wiederholversuch, bevor der Ort gesperrt wird. Der
+        Wiederholversuch faengt das Wettrennen zwischen der direkt gelesenen
+        Karte und der spaeter aktualisierten Kostenkarte von Nav2 ab.
+        """
         status = future.result().status
         self.current_goal_handle = None
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.goals_reached += 1
+            self.metrics.count_reached()
             self.get_logger().info(
-                f"[3b] ===> ERREICHT (#{self.goals_reached}) -> naechstes Ziel."
+                f"[3b] ===> ERREICHT (#{self.metrics.goals_reached}) -> naechstes Ziel."
             )
             self.state = STATE_IDLE
         elif status == GoalStatus.STATUS_CANCELED:
-            # C: Cancel durch Ziel-Invalidierung -> KEINE Blacklist, sofort neu waehlen
             if self.goal_invalidated:
                 self.goal_invalidated = False
                 self.get_logger().info("[C] Ziel abgebrochen (Karte hat es entwertet). Neuwahl.")
                 self.state = STATE_IDLE
                 return
-            # A: Cancel durch Timeout vs. Cancel durch Shutdown unterscheiden
             if self.goal_timed_out:
                 self.goal_timed_out = False
                 if self.active_goal is not None:
-                    self.blacklist.append(self.active_goal)
+                    self.blacklist.add(self.active_goal)
                 self.get_logger().warn(
                     f"[timeout] Ziel verworfen -> Blacklist ({len(self.blacklist)}). Naechstes Ziel."
                 )
@@ -624,24 +960,17 @@ class FrontierExplorer(Node):
                 self.get_logger().warn("[3b] Ziel canceled (Shutdown).")
                 self.state = STATE_IDLE
         else:
-            # D: NICHT beim ersten Fehlschlag blacklisten.
-            #   Real beobachtet: Der Explorer liest /map direkt und feuert ein Ziel im
-            #   frisch dazugekommenen Randstreifen; Nav2s global_costmap verdaut dieselbe
-            #   Kartenerweiterung ~8 ms spaeter und lehnt mit "outside bounds" ab. Das
-            #   groesste Cluster des Laufs (1283 Zellen) ging so an einem Millisekunden-
-            #   Rennen verloren. Ein einziger Retry loest das.
-            key = self.goal_key(self.active_goal)
-            self.goal_failures[key] = self.goal_failures.get(key, 0) + 1
-            fails = self.goal_failures[key]
+            key = self.blacklist.key(self.active_goal)
+            fails = self.blacklist.register_failure(key)
             if fails < MAX_GOAL_ATTEMPTS:
-                self.n_retries += 1                    # E
+                self.metrics.count_retry()
                 self.get_logger().warn(
                     f"[D] FEHLGESCHLAGEN (Status {status}) bei {self.active_goal} "
                     f"-- Versuch {fails}/{MAX_GOAL_ATTEMPTS}, KEINE Blacklist, Neuwahl."
                 )
             else:
                 if self.active_goal is not None:
-                    self.blacklist.append(self.active_goal)
+                    self.blacklist.add(self.active_goal)
                 self.get_logger().warn(
                     f"[3b] FEHLGESCHLAGEN (Status {status}) nach {fails} Versuchen "
                     f"-> Blacklist {self.active_goal} ({len(self.blacklist)})."
@@ -649,26 +978,26 @@ class FrontierExplorer(Node):
             self.state = STATE_IDLE
 
     # ------------------------------------------------------------------
-    # A: Ziel-Timeout (nur fuer Explorations-Ziele, Zustand NAVIGATING)
     def check_goal_timeout(self):
+        """Verwirft ein Explorationsziel, das zu lange aktiv bleibt."""
         if self.shutting_down or self.state != STATE_NAVIGATING:
             return
         if self.goal_timed_out or self.goal_invalidated or self.goal_start_time is None:
-            return  # bereits ausgeloest / wird gerade invalidiert / kein aktives Ziel
+            return
         elapsed = (self.get_clock().now() - self.goal_start_time).nanoseconds / 1e9
-        if elapsed >= self.goal_timeout:
+        if elapsed >= self.config.goal_timeout:
             self.get_logger().warn(
                 f"[timeout] Ziel {self.active_goal} seit {elapsed:.0f}s aktiv "
-                f"(> {self.goal_timeout:.0f}s) -> cancele."
+                f"(> {self.config.goal_timeout:.0f}s) -> cancele."
             )
-            self.goal_timed_out = True   # Blacklist erfolgt im Result-Callback (CANCELED)
-            self.n_timeouts += 1         # E
+            self.goal_timed_out = True
+            self.metrics.count_timeout()
             if self.current_goal_handle is not None:
                 self.current_goal_handle.cancel_goal_async()
 
     # ------------------------------------------------------------------
-    # 3d: Return-to-Home
     def start_return_home(self):
+        """Sendet die gemerkte Startpose als Ziel und wechselt nach RETURNING."""
         if self.home_pose is None:
             self.get_logger().warn(
                 "[3d] Keine Home-Pose gemerkt -> kann nicht zurueckkehren. -> DONE."
@@ -681,11 +1010,11 @@ class FrontierExplorer(Node):
         self.active_goal = (hx, hy)
         goal_msg = NavigateToPose.Goal()
         ps = PoseStamped()
-        ps.header.frame_id = self.global_frame
+        ps.header.frame_id = self.config.global_frame
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose.position.x = hx
         ps.pose.position.y = hy
-        ps.pose.orientation.w = 1.0   # Ziel-Ausrichtung egal (yaw_goal_tolerance weit offen)
+        ps.pose.orientation.w = 1.0
         goal_msg.pose = ps
         self.get_logger().info(
             f"[3d] ===> RETURN-TO-HOME (Versuch {self.home_attempts + 1}/{MAX_HOME_ATTEMPTS}): "
@@ -695,6 +1024,7 @@ class FrontierExplorer(Node):
         fut.add_done_callback(self.home_response_cb)
 
     def home_response_cb(self, future):
+        """Behandelt die Annahme oder Ablehnung des Rueckkehrziels."""
         gh = future.result()
         if not gh.accepted:
             self.current_goal_handle = None
@@ -717,25 +1047,24 @@ class FrontierExplorer(Node):
         res_fut.add_done_callback(self.home_result_cb)
 
     def home_result_cb(self, future):
+        """Wertet das Ergebnis der Rueckkehr aus und schliesst den Lauf ab."""
         status = future.result().status
         self.current_goal_handle = None
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.state = STATE_DONE
             self.active_goal = None
-            self.t_home = self.get_clock().now()       # E
-            self.rth_ok = True                         # E
+            self.metrics.mark_home(self.get_clock().now(), True)
             self.get_logger().info(
                 f"[3d] ===> HOME ERREICHT: zurueck an der Startpose. "
-                f"{self.goals_reached} Frontier-Ziele erkundet. Autonomiezyklus komplett."
+                f"{self.metrics.goals_reached} Frontier-Ziele erkundet. Autonomiezyklus komplett."
             )
-            self.print_eval()                          # E
+            self.metrics.print_eval(self.get_logger(), len(self.blacklist), self.config)
             return
         if status == GoalStatus.STATUS_CANCELED:
             self.get_logger().warn("[3d] Home-Ziel canceled (Shutdown).")
             self.state = STATE_DONE
             self.active_goal = None
             return
-        # fehlgeschlagen
         self.home_attempts += 1
         if self.home_attempts < MAX_HOME_ATTEMPTS:
             self.get_logger().warn(
@@ -749,69 +1078,14 @@ class FrontierExplorer(Node):
             )
             self.state = STATE_DONE
             self.active_goal = None
-            self.t_home = self.get_clock().now()       # E
-            self.rth_ok = False                        # E
-            self.print_eval()                          # E
+            self.metrics.mark_home(self.get_clock().now(), False)
+            self.metrics.print_eval(self.get_logger(), len(self.blacklist), self.config)
 
     # ------------------------------------------------------------------
-    # E: Auswertung nach Expose 5.3 -- eine Zeile pro Lauf, direkt uebernehmbar
-    def print_eval(self):
-        if self.eval_printed:
-            return
-        self.eval_printed = True
-
-        def secs(a, b):
-            if a is None or b is None:
-                return None
-            return (b - a).nanoseconds / 1e9
-
-        t_expl = secs(self.t_start, self.t_explore_end)
-        t_rth = secs(self.t_explore_end, self.t_home)
-        t_ges = secs(self.t_start, self.t_home)
-        d_expl = self.dist_at_explore_end
-        d_rth = (self.dist_total - d_expl) if d_expl is not None else None
-        d_ges = self.dist_total
-
-        def f(v, nk=1):
-            return "n/a" if v is None else f"{v:.{nk}f}"
-
-        rth = {True: "ERFOLGREICH", False: "FEHLGESCHLAGEN"}.get(self.rth_ok, "ABGEBROCHEN")
-
-        L = self.get_logger()
-        L.info("=" * 64)
-        L.info("[EVAL] LAUF-METRIKEN (Expose 5.3) -- ALLE ZEITEN IN SIM-ZEIT")
-        L.info("=" * 64)
-        L.info(f"[EVAL] Ziele erreicht         : {self.goals_reached}")
-        L.info(f"[EVAL] Explorationszeit       : {f(t_expl)} s")
-        L.info(f"[EVAL] Return-to-Home-Zeit    : {f(t_rth)} s")
-        L.info(f"[EVAL] Gesamtzeit             : {f(t_ges)} s")
-        L.info(f"[EVAL] Distanz Exploration    : {f(d_expl, 2)} m")
-        L.info(f"[EVAL] Distanz Return-to-Home : {f(d_rth, 2)} m")
-        L.info(f"[EVAL] Distanz gesamt         : {f(d_ges, 2)} m")
-        L.info(f"[EVAL] Return-to-Home         : {rth}")
-        L.info(f"[EVAL] Blacklist-Eintraege    : {len(self.blacklist)}")
-        L.info(f"[EVAL] Ziel-Revalidierungen(C): {self.n_revalidated}")
-        L.info(f"[EVAL] Ziel-Retries (D)       : {self.n_retries}")
-        L.info(f"[EVAL] Ziel-Timeouts (A)      : {self.n_timeouts}")
-        L.info(f"[EVAL] Konfig                 : goal_clearance={self.goal_clearance} "
-               f"min_goal_distance={self.min_goal_distance} size_weight={self.size_weight}")
-        # Eine Zeile fuer die Tabelle. Semikolon = deutsches Excel.
-        L.info(
-            "[EVAL] CSV;ziele;t_expl;t_rth;t_ges;d_expl;d_rth;d_ges;rth;blacklist;reval;retry;timeout;clearance"
-        )
-        L.info(
-            f"[EVAL] CSV;{self.goals_reached};{f(t_expl)};{f(t_rth)};{f(t_ges)};"
-            f"{f(d_expl, 2)};{f(d_rth, 2)};{f(d_ges, 2)};{rth};{len(self.blacklist)};"
-            f"{self.n_revalidated};{self.n_retries};{self.n_timeouts};{self.goal_clearance}"
-        )
-        L.info("=" * 64)
-        L.info("[EVAL] HINWEIS: Karte JETZT sichern, solange SLAM laeuft:")
-        L.info("[EVAL]   ros2 run nav2_map_server map_saver_cli -f /root/maps/<name> -t /map")
-        L.info("=" * 64)
-
     def cancel_active_goal(self):
+        """Bricht beim Beenden ein laufendes Ziel ab und gibt Teilmetriken aus."""
         self.shutting_down = True
-        self.print_eval()          # E: auch bei Strg-C die Teilmetriken ausgeben
+        self.metrics.print_eval(self.get_logger(), len(self.blacklist), self.config)
         if self.current_goal_handle is not None:
             self.get_logger().info("[3b] Beende -> cancele laufendes Nav2-Ziel...")
             try:
@@ -820,91 +1094,10 @@ class FrontierExplorer(Node):
             except Exception as e:
                 self.get_logger().warn(f"[3b] Cancel fehlgeschlagen: {e}")
 
-    # ------------------------------------------------------------------
-    def publish_markers(self, header, frontier, w, h, res, ox, oy, valid, best):
-        arr = MarkerArray()
-
-        cells = Marker()
-        cells.header = header
-        cells.ns = "frontier_cells"
-        cells.id = 0
-        cells.type = Marker.CUBE_LIST
-        cells.action = Marker.ADD
-        cells.scale.x = res
-        cells.scale.y = res
-        cells.scale.z = max(res * 0.2, 0.01)
-        cells.color = ColorRGBA(r=0.1, g=1.0, b=0.2, a=0.9)  # gruen
-        cells.pose.orientation.w = 1.0
-        for idx in range(w * h):
-            if frontier[idx]:
-                r = idx // w
-                c = idx % w
-                cells.points.append(Point(x=ox + (c + 0.5) * res,
-                                          y=oy + (r + 0.5) * res, z=0.06))
-        arr.markers.append(cells)
-
-        cent = Marker()
-        cent.header = header
-        cent.ns = "frontier_centroids"
-        cent.id = 1
-        cent.type = Marker.SPHERE_LIST
-        cent.action = Marker.ADD
-        cent.scale.x = 0.15
-        cent.scale.y = 0.15
-        cent.scale.z = 0.15
-        cent.color = ColorRGBA(r=1.0, g=0.55, b=0.0, a=1.0)  # orange
-        cent.pose.orientation.w = 1.0
-        for cx, cy, n, gx, gy in valid:
-            cent.points.append(Point(x=cx, y=cy, z=0.15))
-        arr.markers.append(cent)
-
-        goal = Marker()
-        goal.header = header
-        goal.ns = "frontier_goal"
-        goal.id = 2
-        goal.type = Marker.ARROW
-        if best is not None:
-            gx, gy, n, dist, cost, yaw = best
-            goal.action = Marker.ADD
-            goal.scale.x = 0.5
-            goal.scale.y = 0.1
-            goal.scale.z = 0.1
-            goal.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)  # rot
-            goal.pose.position.x = gx
-            goal.pose.position.y = gy
-            goal.pose.position.z = 0.2
-            goal.pose.orientation.z = math.sin(yaw / 2.0)
-            goal.pose.orientation.w = math.cos(yaw / 2.0)
-        else:
-            goal.action = Marker.DELETE
-        arr.markers.append(goal)
-
-        act = Marker()
-        act.header = header
-        act.ns = "active_goal"
-        act.id = 3
-        act.type = Marker.CYLINDER
-        if self.active_goal is not None:
-            ax, ay = self.active_goal
-            act.action = Marker.ADD
-            act.scale.x = 0.2
-            act.scale.y = 0.2
-            act.scale.z = 0.8
-            act.color = ColorRGBA(r=1.0, g=0.85, b=0.0, a=0.85)  # gold
-            act.pose.position.x = ax
-            act.pose.position.y = ay
-            act.pose.position.z = 0.4
-            act.pose.orientation.w = 1.0
-        else:
-            act.action = Marker.DELETE
-        arr.markers.append(act)
-
-        self.pub.publish(arr)
-
 
 def main():
     rclpy.init(args=sys.argv)
-    node = FrontierExplorer()
+    node = FrontierExplorerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
