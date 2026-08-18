@@ -15,9 +15,9 @@ strukturell ueberarbeitet und verhaelt sich nachweislich identisch.
 
 Zwei Teilsysteme, gekoppelt ueber DDS und eine gemeinsame Simulationszeit.
 
-| | Teilsystem 1 (Host) | Teilsystem 2 (Container `welt2_nav:jazzy`) |
+| | Teilsystem 1 (Host) | Teilsystem 2 (Container) |
 |---|---|---|
-| Inhalt | Isaac-Lab-Szene, Go2, trainierte Lauf-Policy | SLAM Toolbox, Nav2, Frontier-Knoten |
+| Inhalt | Isaac-Szene, Go2, trainierte Lauf-Policy | SLAM Toolbox, Nav2, Frontier-Knoten |
 | Publiziert | `/scan` `/odom` `/tf` `/tf_static` `/clock` | `/map`, `map->odom`, `/cmd_vel` |
 | Abonniert | `/cmd_vel` | `/scan` `/tf` `/clock` |
 
@@ -40,7 +40,7 @@ die Zustandsschaetzung. Realer Drift bleibt damit ausgeblendet.
 ```
 isaac/       Teilsystem 1: Szene, Startwrapper, Deployment-Policy
 nav2_slam/   Teilsystem 2: Dockerfiles, DDS-Profil, SLAM- und Nav2-Parameter
-frontier/    Frontier-Explorer (eigener rclpy-Knoten, objektorientiert)
+frontier/    Frontier-Explorer
 tools/       Passive Messknoten der Evaluierung
 ```
 
@@ -82,7 +82,7 @@ Zur Kontrolle nennt die `[SZENE]`-Zeile beim Start Abmessungen und Objektzahl.
 
 ---
 
-## Umgebung (verifiziert)
+## Umgebung
 
 | Komponente | Version |
 |---|---|
@@ -91,7 +91,7 @@ Zur Kontrolle nennt die `[SZENE]`-Zeile beim Start Abmessungen und Objektzahl.
 | NVIDIA-Treiber | 580.95.05 (Open Kernel Module) |
 | Isaac Sim / Isaac Lab | 5.1.0 / 2.3.0 |
 | Python (Isaac-venv) | 3.11, torch 2.7.0+cu128 |
-| ROS 2 | Jazzy (Container `ros:jazzy-ros-base`) |
+| ROS 2 | Jazzy (Container ebenfalls) |
 | DDS | `rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`, UDPv4 erzwungen (SHM aus) |
 | Docker | 29.4.2, Container CPU-only |
 
@@ -118,7 +118,6 @@ Abschnitt.
 **Terminal 1 — Isaac (Host)**
 
 ```bash
-sudo systemctl stop ollama          # GPU-Speicher freigeben
 xhost +local:root                   # Display fuer RViz im Container freigeben
 ~/go2_autonomy/isaac/run_go2_scan.sh --szene ringflur
 ```
@@ -150,16 +149,6 @@ ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true \
 `/root/repo` ist nur lesend eingehaengt. Der Container laeuft als root und darf
 nicht in den Git-Baum schreiben. Warten auf
 `Registering sensor: [Custom Described Lidar]`, dann offen lassen.
-
-**TF-Gate — Pflicht vor Nav2**
-
-```bash
-docker exec -it welt2 bash
-ros2 run tf2_ros tf2_echo odom base_link
-```
-
-Erst wenn eine echte Transform kommt, mit Strg-C beenden und weiter. Startet Nav2
-vorher, bricht der Bringup ab und der Explorer sperrt alle Ziele.
 
 **Terminal 3 — Nav2**
 
