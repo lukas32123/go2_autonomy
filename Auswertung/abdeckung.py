@@ -69,15 +69,20 @@ def freiflaeche_ringflur() -> float:
     kern = (2.0 * core_solid) * (2.0 * core_y)
     pfeiler = 0.0
     for _ in (1, -1):
+        # Die Pfeilerabschnitte laufen ueber OUTER, die Bezugsflaeche gesamt
+        # aber nur ueber die lichte Weite 2*back. Die ueberstehenden Enden
+        # liegen in der querstehenden Rueckwand und duerfen nicht zaehlen.
         for a, b in spans(OUTER, centers(OUTER, PW)):
+            a, b = max(a, -back), min(b, back)
             pfeiler += (b - a) * ND
         for a, b in spans(OUTER, centers(OUTER, PN)):
+            a, b = max(a, -back), min(b, back)
             pfeiler += ND * (b - a)
+    # In jeder Ecke ueberlagern sich der Pfeiler der breiten und der der
+    # schmalen Seite auf ND x ND. Ohne diese Zeile wird die Flaeche doppelt
+    # abgezogen.
+    pfeiler -= 4.0 * ND * ND
     core_len = 2.0 * core_y
-    for _ in (1, -1):
-        for a, b in spans(core_len, centers(core_len, PN)):
-            pfeiler += ND * (b - a)
-    return gesamt - kern - pfeiler
 
 
 def freiflaeche_saeulenraum() -> tuple[float, int]:
